@@ -80,7 +80,7 @@ DEFAULT_COMPARISON_MODELS = (
     "blend_baseline_gradient_boosting",
 )
 DEFAULT_MODEL_PARAMS = {
-    "ridge": {"alpha": 7.5},
+    "ridge": {"alpha": 5.0},
     "elastic_net": {"alpha": 0.1, "l1_ratio": 0.2, "max_iter": 10000},
     "random_forest": {"n_estimators": 100, "max_depth": 4, "min_samples_leaf": 2},
     "gradient_boosting": {
