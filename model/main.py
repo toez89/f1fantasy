@@ -7,11 +7,11 @@ Run this script to:
   3. Optionally run the backtester
 
 Usage examples:
-  # Optimise team for Australia 2026 (default):
+  # Optimise team for Miami 2026 (default):
   python main.py
 
-  # Backtest over all 2023+2024 Australia races:
-  python main.py --backtest --seasons 2023 2024 --circuit australia
+  # Backtest over all 2023+2024 Miami races:
+  python main.py --backtest --seasons 2023 2024 --circuit miami
 
   # Backtest ALL races in 2024:
   python main.py --backtest --seasons 2024 --circuit all
@@ -26,6 +26,7 @@ Usage examples:
 import argparse
 import sys
 import json
+import time
 import pandas as pd
 from pathlib import Path
 
@@ -37,13 +38,14 @@ from value_model  import build_history_df, score_all
 from optimizer    import optimise_team, print_team
 from backtest     import (compute_all_weekends, run_backtest, summarise_backtest,
                            CURRENT_DRIVER_COSTS, CURRENT_CONSTRUCTOR_COSTS,
-                           TESTING_BONUSES)
+                           CURRENT_BUDGET_CAP, TESTING_BONUSES)
 from seed_data    import get_seeded_weekends
 
 CACHE_DIR = Path(__file__).parent / ".cache"
 CACHE_DIR.mkdir(exist_ok=True)
+CURRENT_SEASON_CACHE_TTL_SECONDS = 60 * 60 * 12
 
-TARGET_CIRCUIT = "Albert Park Grand Prix Circuit"
+TARGET_CIRCUIT = "Miami International Autodrome"
 CURRENT_SEASON = 2026
 
 TRAIN_SEASONS  = [2022, 2023, 2024]    # seasons used to train the model
@@ -53,22 +55,54 @@ TRAIN_SEASONS  = [2022, 2023, 2024]    # seasons used to train the model
 # Helpers
 # ---------------------------------------------------------------------------
 
-def load_or_fetch(season: int) -> list[dict]:
+def _load_cached_weekends(cache_path: Path, max_age_seconds: int | None = None) -> list[dict] | None:
+    """Return cached weekends when the cache contains usable race data."""
+    if not cache_path.exists():
+        return None
+    if max_age_seconds is not None:
+        cache_age = time.time() - cache_path.stat().st_mtime
+        if cache_age > max_age_seconds:
+            return None
+    wkds = json.loads(cache_path.read_text())
+    if not wkds:
+        return None
+
+    first_driver = (((wkds or [{}])[0]).get("drivers") or [{}])[0]
+    required_fields = {
+        "quali_reached_q2",
+        "quali_reached_q3",
+        "quali_no_time",
+        "quali_dsq",
+        "sprint_pos",
+        "race_fastest_lap",
+        "race_dsq",
+    }
+    return wkds if required_fields.issubset(first_driver.keys()) else None
+
+
+def load_or_fetch(season: int, *, max_cache_age_seconds: int | None = None) -> list[dict]:
     cache = CACHE_DIR / f"weekends_{season}.json"
-    if cache.exists():
-        wkds = json.loads(cache.read_text())
-        print(f"  [cache] Season {season}: {len(wkds)} races loaded")
-        return compute_all_weekends(wkds)
+    cached_weekends = _load_cached_weekends(cache, max_age_seconds=max_cache_age_seconds)
+    if cached_weekends is not None:
+        print(f"  [cache] Season {season}: {len(cached_weekends)} races loaded")
+        return compute_all_weekends(cached_weekends)
     # Try live API first, fall back to seeded data
     try:
         print(f"  Fetching season {season} from Jolpica API...")
-        wkds = build_weekend_records(season)
-        cache.write_text(json.dumps(wkds))
-        print(f"  Fetched {len(wkds)} races from API")
+        wkds = build_weekend_records(season, use_cache=max_cache_age_seconds is None)
+        if wkds:
+            cache.write_text(json.dumps(wkds))
+            print(f"  Fetched {len(wkds)} races from API")
+            return compute_all_weekends(wkds)
+        print(f"  API returned no completed races for {season}, checking seed data")
     except Exception as e:
         print(f"  API unavailable ({type(e).__name__}), using seeded data")
-        wkds = [w for w in get_seeded_weekends() if w["season"] == season]
-        print(f"  Loaded {len(wkds)} seeded races for {season}")
+    stale_weekends = _load_cached_weekends(cache)
+    if stale_weekends is not None:
+        print(f"  [stale cache] Season {season}: {len(stale_weekends)} races loaded")
+        return compute_all_weekends(stale_weekends)
+    wkds = [w for w in get_seeded_weekends() if w["season"] == season]
+    print(f"  Loaded {len(wkds)} seeded races for {season}")
     return compute_all_weekends(wkds)
 
 
@@ -78,14 +112,16 @@ def load_or_fetch(season: int) -> list[dict]:
 
 def run_optimise(args):
     print("\n" + "=" * 62)
-    print("  F1 FANTASY MODEL — AUSTRALIA GP 2026")
+    print("  F1 FANTASY MODEL — MIAMI GP 2026")
     print("=" * 62)
 
     # Step 1: Load training data
     print("\n[1/4] Loading historical data...")
     all_weekends = []
-    for s in TRAIN_SEASONS:
-        all_weekends.extend(load_or_fetch(s))
+    seasons_to_load = sorted(set(TRAIN_SEASONS + [CURRENT_SEASON]))
+    for s in seasons_to_load:
+        cache_ttl = CURRENT_SEASON_CACHE_TTL_SECONDS if s == CURRENT_SEASON else None
+        all_weekends.extend(load_or_fetch(s, max_cache_age_seconds=cache_ttl))
 
     df_train = build_history_df(all_weekends)
     print(f"  Training set: {len(df_train)} driver-race records "
@@ -209,10 +245,10 @@ def main():
                         help="Run backtester instead of optimiser")
     parser.add_argument("--seasons",   nargs="+", type=int, default=[2023, 2024],
                         help="Seasons for backtest (default: 2023 2024)")
-    parser.add_argument("--circuit",   type=str, default="australia",
-                        help="Circuit for backtest (default: australia, or 'all')")
-    parser.add_argument("--budget",    type=float, default=100.0,
-                        help="Budget cap in millions (default: 100)")
+    parser.add_argument("--circuit",   type=str, default="miami",
+                        help="Circuit for backtest (default: miami, or 'all')")
+    parser.add_argument("--budget",    type=float, default=CURRENT_BUDGET_CAP,
+                        help=f"Budget cap in millions (default: {CURRENT_BUDGET_CAP})")
     parser.add_argument("--lock",      nargs="+", default=[],
                         help="Driver names to lock into team")
     parser.add_argument("--exclude",   nargs="+", default=[],

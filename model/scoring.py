@@ -1,173 +1,263 @@
 """
-F1 Fantasy Scoring Engine
-Computes official F1 Fantasy points from race/qualifying results.
+F1 Fantasy 2026 scoring engine.
 
-Official 2026 scoring rules:
-  - Race finish:     P1=25, P2=18, P3=15, P4=12, P5=10, P6=8, P7=6, P8=4, P9=2, P10=1
-  - Qualifying:      P1=10, P2=9, P3=8, P4=7, P5=6, P6=5, P7=4, P8=3, P9=2, P10=1
-  - Places gained (race): +2 per position moved forward
-  - Places lost   (race): -1 per position moved back
-  - Beat teammate in qualifying: +3
-  - Beat teammate in race:       +3
-  - DNF / DSQ / NC (race):      -20
-  - DNF (sprint):                -10
-  - Fastest lap:    removed in 2025/2026
-  Constructors score the SUM of both drivers' points.
+This module computes driver and constructor weekend totals using the 2026
+rule set supplied for this project. It supports the rule items that can be
+derived from current weekend data and accepts optional manual fields for the
+rest (for example overtakes, pit-stop bonuses, or Driver of the Day).
 """
 
-RACE_POINTS = {1: 25, 2: 18, 3: 15, 4: 12, 5: 10,
-               6: 8,  7: 6,  8: 4,  9: 2,  10: 1}
-
-QUALI_POINTS = {1: 10, 2: 9, 3: 8, 4: 7, 5: 6,
-                6: 5,  7: 4, 8: 3, 9: 2, 10: 1}
-
-PLACES_GAINED_BONUS   = 2   # per position forward
-PLACES_LOST_PENALTY   = -1  # per position backward
-BEAT_TEAMMATE_BONUS   = 3   # qualifying + race (each)
-DNF_PENALTY           = -20
-DNF_SPRINT_PENALTY    = -10
+from __future__ import annotations
 
 
-def driver_fantasy_points(
-    quali_pos: int | None,
-    race_pos:  int | None,
-    grid_pos:  int | None,       # starting grid position (after penalties etc.)
-    beat_tm_quali: bool = False,
-    beat_tm_race:  bool = False,
-    dnf: bool = False,
+QUALI_RESULT_POINTS = {
+    1: 10, 2: 9, 3: 8, 4: 7, 5: 6,
+    6: 5, 7: 4, 8: 3, 9: 2, 10: 1,
+}
+SPRINT_RESULT_POINTS = {
+    1: 8, 2: 7, 3: 6, 4: 5, 5: 4, 6: 3, 7: 2, 8: 1,
+}
+RACE_RESULT_POINTS = {
+    1: 25, 2: 18, 3: 15, 4: 12, 5: 10,
+    6: 8, 7: 6, 8: 4, 9: 2, 10: 1,
+}
+
+QUALI_NO_TIME_OR_DSQ_PENALTY = -5
+QUALI_CONSTRUCTOR_DSQ_PENALTY = -5
+
+SPRINT_POSITION_DELTA_BONUS = 1
+SPRINT_POSITION_DELTA_PENALTY = -1
+SPRINT_OVERTAKE_POINTS = 1
+SPRINT_FASTEST_LAP_POINTS = 5
+SPRINT_DNF_OR_DSQ_PENALTY = -10
+SPRINT_CONSTRUCTOR_DSQ_PENALTY = -10
+
+RACE_POSITION_DELTA_BONUS = 1
+RACE_POSITION_DELTA_PENALTY = -1
+RACE_OVERTAKE_POINTS = 1
+RACE_FASTEST_LAP_POINTS = 10
+RACE_DRIVER_OF_DAY_POINTS = 10
+RACE_DNF_OR_DSQ_PENALTY = -20
+RACE_CONSTRUCTOR_DSQ_PENALTY = -20
+
+PITSTOP_TIME_POINTS = [
+    (2.0, 20),
+    (2.2, 10),
+    (2.5, 5),
+    (3.0, 2),
+]
+FASTEST_PITSTOP_BONUS = 5
+PITSTOP_WORLD_RECORD_BONUS = 15
+
+
+def _normalise_name(driver: dict) -> str:
+    return driver.get("driver_name") or driver.get("name", "Unknown")
+
+
+def _as_bool(value) -> bool:
+    return bool(value)
+
+
+def _positions_delta_points(
+    start_pos: int | None,
+    finish_pos: int | None,
+    non_classified: bool,
+    gain_points: int,
+    loss_points: int,
 ) -> float:
-    """
-    Calculate total F1 Fantasy points for a single driver for one race weekend.
+    if non_classified or start_pos is None or finish_pos is None:
+        return 0.0
 
-    Parameters
-    ----------
-    quali_pos      : final qualifying position (1-20). None if no time set.
-    race_pos       : race finish position (1-20). None if DNF/DSQ.
-    grid_pos       : grid position at race start (used for places-gained calc).
-                     Defaults to quali_pos if not supplied.
-    beat_tm_quali  : True if driver beat their teammate in qualifying.
-    beat_tm_race   : True if driver beat their teammate in race classification.
-    dnf            : True if the driver did not finish / was disqualified.
+    delta = start_pos - finish_pos
+    if delta > 0:
+        return float(delta * gain_points)
+    if delta < 0:
+        return float(abs(delta) * loss_points)
+    return 0.0
 
-    Returns
-    -------
-    total points (float)
-    """
+
+def _pitstop_time_points(best_time: float | None) -> float:
+    if best_time is None:
+        return 0.0
+    for threshold, points in PITSTOP_TIME_POINTS:
+        if best_time < threshold:
+            return float(points)
+    return 0.0
+
+
+def qualifying_driver_points(driver: dict) -> float:
+    """Compute 2026 qualifying points for one driver."""
+    if _as_bool(driver.get("quali_no_time")) or _as_bool(driver.get("quali_dsq")):
+        return float(QUALI_NO_TIME_OR_DSQ_PENALTY)
+    return float(QUALI_RESULT_POINTS.get(driver.get("quali_pos"), 0))
+
+
+def sprint_driver_points(driver: dict) -> float:
+    """Compute 2026 sprint points for one driver."""
     pts = 0.0
+    sprint_pos = driver.get("sprint_pos")
+    sprint_dnf = _as_bool(driver.get("sprint_dnf"))
+    sprint_dsq = _as_bool(driver.get("sprint_dsq"))
 
-    # --- Qualifying points ---
-    if quali_pos is not None:
-        pts += QUALI_POINTS.get(quali_pos, 0)
+    if not sprint_dnf and not sprint_dsq and sprint_pos is not None:
+        pts += SPRINT_RESULT_POINTS.get(sprint_pos, 0)
 
-    # --- Race finish points ---
-    if not dnf and race_pos is not None:
-        pts += RACE_POINTS.get(race_pos, 0)
+    pts += _positions_delta_points(
+        start_pos=driver.get("sprint_grid_pos"),
+        finish_pos=sprint_pos,
+        non_classified=sprint_dnf or sprint_dsq,
+        gain_points=SPRINT_POSITION_DELTA_BONUS,
+        loss_points=SPRINT_POSITION_DELTA_PENALTY,
+    )
+    pts += float(driver.get("sprint_overtakes", 0) or 0) * SPRINT_OVERTAKE_POINTS
 
-    # --- Places gained / lost ---
-    start = grid_pos if grid_pos is not None else quali_pos
-    if start is not None and race_pos is not None and not dnf:
-        delta = start - race_pos          # positive = moved forward
-        if delta > 0:
-            pts += delta * PLACES_GAINED_BONUS
-        elif delta < 0:
-            pts += delta * abs(PLACES_LOST_PENALTY)  # delta is negative
-
-    # --- Teammate battles ---
-    if beat_tm_quali:
-        pts += BEAT_TEAMMATE_BONUS
-    if beat_tm_race:
-        pts += BEAT_TEAMMATE_BONUS
-
-    # --- DNF penalty ---
-    if dnf:
-        pts += DNF_PENALTY
-
-    return pts
+    if _as_bool(driver.get("sprint_fastest_lap")):
+        pts += SPRINT_FASTEST_LAP_POINTS
+    if sprint_dnf or sprint_dsq:
+        pts += SPRINT_DNF_OR_DSQ_PENALTY
+    return float(pts)
 
 
-def compute_race_weekend(driver_results: list[dict]) -> dict[str, float]:
+def race_driver_points(driver: dict) -> float:
+    """Compute 2026 race points for one driver."""
+    pts = 0.0
+    race_pos = driver.get("race_pos")
+    race_dnf = _as_bool(driver.get("dnf"))
+    race_dsq = _as_bool(driver.get("race_dsq"))
+
+    if not race_dnf and not race_dsq and race_pos is not None:
+        pts += RACE_RESULT_POINTS.get(race_pos, 0)
+
+    pts += _positions_delta_points(
+        start_pos=driver.get("grid_pos"),
+        finish_pos=race_pos,
+        non_classified=race_dnf or race_dsq,
+        gain_points=RACE_POSITION_DELTA_BONUS,
+        loss_points=RACE_POSITION_DELTA_PENALTY,
+    )
+    pts += float(driver.get("race_overtakes", 0) or 0) * RACE_OVERTAKE_POINTS
+
+    if _as_bool(driver.get("race_fastest_lap")):
+        pts += RACE_FASTEST_LAP_POINTS
+    if _as_bool(driver.get("driver_of_day")):
+        pts += RACE_DRIVER_OF_DAY_POINTS
+    if race_dnf or race_dsq:
+        pts += RACE_DNF_OR_DSQ_PENALTY
+    return float(pts)
+
+
+def driver_fantasy_points(driver: dict) -> float:
+    """Compute total weekend points for one driver."""
+    return float(
+        qualifying_driver_points(driver)
+        + sprint_driver_points(driver)
+        + race_driver_points(driver)
+    )
+
+
+def _qualifying_constructor_bonus(team_drivers: list[dict]) -> float:
+    q2_count = sum(1 for driver in team_drivers if _as_bool(driver.get("quali_reached_q2")))
+    q3_count = sum(1 for driver in team_drivers if _as_bool(driver.get("quali_reached_q3")))
+
+    if q3_count >= 2:
+        return 10.0
+    if q3_count == 1:
+        return 5.0
+    if q2_count >= 2:
+        return 3.0
+    if q2_count == 1:
+        return 1.0
+    return -1.0
+
+
+def _constructor_pitstop_bonus(
+    constructor: str,
+    weekend_meta: dict | None,
+) -> float:
+    if not weekend_meta:
+        return 0.0
+
+    pts = 0.0
+    pitstop_times = weekend_meta.get("constructor_pitstop_times", {}) or {}
+    best_time = pitstop_times.get(constructor)
+    if isinstance(best_time, list) and best_time:
+        best_time = min(best_time)
+    pts += _pitstop_time_points(best_time)
+
+    fastest_pitstop = weekend_meta.get("fastest_pitstop")
+    if fastest_pitstop == constructor or constructor in set(weekend_meta.get("fastest_pitstop_teams", []) or []):
+        pts += FASTEST_PITSTOP_BONUS
+
+    world_record = weekend_meta.get("pitstop_world_record")
+    if world_record == constructor or constructor in set(weekend_meta.get("pitstop_world_record_teams", []) or []):
+        pts += PITSTOP_WORLD_RECORD_BONUS
+    return float(pts)
+
+
+def constructor_fantasy_points(
+    driver_scores: dict[str, float],
+    team_map: dict[str, str],
+    driver_results: list[dict] | None = None,
+    weekend_meta: dict | None = None,
+) -> dict[str, float]:
     """
-    Compute fantasy points for every driver in a race weekend.
+    Compute constructor totals.
 
-    Parameters
-    ----------
-    driver_results : list of dicts, one per driver, each containing:
-        {
-          'name'       : str,
-          'team'       : str,
-          'quali_pos'  : int | None,
-          'race_pos'   : int | None,
-          'grid_pos'   : int | None,   # optional
-          'dnf'        : bool,
-        }
-
-    Returns
-    -------
-    dict mapping driver name -> fantasy points
+    When `driver_results` is omitted, this falls back to a simple sum of driver
+    totals for backwards compatibility.
     """
-    # Group by team to resolve teammate battles
+    if not driver_results:
+        totals: dict[str, float] = {}
+        for driver, pts in driver_scores.items():
+            team = team_map.get(driver, "Unknown")
+            totals[team] = totals.get(team, 0.0) + float(pts)
+        return totals
+
     teams: dict[str, list[dict]] = {}
-    for d in driver_results:
-        teams.setdefault(d['team'], []).append(d)
+    for driver in driver_results:
+        teams.setdefault(driver["team"], []).append(driver)
 
-    scores = {}
-    for team_drivers in teams.values():
-        # Support both 'name' and 'driver_name' keys
-        def _name(d): return d.get('driver_name') or d.get('name', 'Unknown')
-
-        if len(team_drivers) == 2:
-            a, b = team_drivers
-            # Qualifying battle
-            aq, bq = a.get('quali_pos'), b.get('quali_pos')
-            beat_tm_quali_a = (aq is not None and bq is not None and aq < bq)
-            beat_tm_quali_b = (aq is not None and bq is not None and bq < aq)
-            # Race battle (only for finishers)
-            ar, br = (None if a.get('dnf') else a.get('race_pos')), \
-                     (None if b.get('dnf') else b.get('race_pos'))
-            beat_tm_race_a = (ar is not None and br is not None and ar < br)
-            beat_tm_race_b = (ar is not None and br is not None and br < ar)
-        else:
-            beat_tm_quali_a = beat_tm_race_a = False
-            beat_tm_quali_b = beat_tm_race_b = False
-            a = team_drivers[0]; b = None
-
-        scores[_name(a)] = driver_fantasy_points(
-            quali_pos=a.get('quali_pos'),
-            race_pos=a.get('race_pos'),
-            grid_pos=a.get('grid_pos'),
-            beat_tm_quali=beat_tm_quali_a,
-            beat_tm_race=beat_tm_race_a,
-            dnf=a.get('dnf', False),
-        )
-        if b:
-            scores[_name(b)] = driver_fantasy_points(
-                quali_pos=b.get('quali_pos'),
-                race_pos=b.get('race_pos'),
-                grid_pos=b.get('grid_pos'),
-                beat_tm_quali=beat_tm_quali_b,
-                beat_tm_race=beat_tm_race_b,
-                dnf=b.get('dnf', False),
-            )
-
-    return scores
-
-
-def constructor_fantasy_points(driver_scores: dict[str, float],
-                                team_map: dict[str, str]) -> dict[str, float]:
-    """
-    Sum driver points per constructor.
-
-    Parameters
-    ----------
-    driver_scores : {driver_name: points}
-    team_map      : {driver_name: team_name}
-
-    Returns
-    -------
-    {team_name: total_points}
-    """
     totals: dict[str, float] = {}
-    for driver, pts in driver_scores.items():
-        team = team_map.get(driver, 'Unknown')
-        totals[team] = totals.get(team, 0) + pts
+    for constructor, team_drivers in teams.items():
+        quali_total = sum(qualifying_driver_points(driver) for driver in team_drivers)
+        sprint_total = sum(sprint_driver_points(driver) for driver in team_drivers)
+        race_total = 0.0
+        for driver in team_drivers:
+            race_points = race_driver_points(driver)
+            if _as_bool(driver.get("driver_of_day")):
+                race_points -= RACE_DRIVER_OF_DAY_POINTS
+            race_total += race_points
+
+        quali_dsq_penalty = QUALI_CONSTRUCTOR_DSQ_PENALTY * sum(
+            1 for driver in team_drivers if _as_bool(driver.get("quali_dsq"))
+        )
+        sprint_dsq_penalty = SPRINT_CONSTRUCTOR_DSQ_PENALTY * sum(
+            1 for driver in team_drivers if _as_bool(driver.get("sprint_dsq"))
+        )
+        race_dsq_penalty = RACE_CONSTRUCTOR_DSQ_PENALTY * sum(
+            1 for driver in team_drivers if _as_bool(driver.get("race_dsq"))
+        )
+
+        totals[constructor] = float(
+            quali_total
+            + _qualifying_constructor_bonus(team_drivers)
+            + quali_dsq_penalty
+            + sprint_total
+            + sprint_dsq_penalty
+            + race_total
+            + race_dsq_penalty
+            + _constructor_pitstop_bonus(constructor, weekend_meta)
+        )
+
     return totals
+
+
+def compute_race_weekend(
+    driver_results: list[dict],
+    weekend_meta: dict | None = None,
+) -> dict[str, float]:
+    """Compute total weekend points for every driver in a weekend."""
+    return {
+        _normalise_name(driver): driver_fantasy_points(driver)
+        for driver in driver_results
+    }

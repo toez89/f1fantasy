@@ -15,6 +15,9 @@ build/
 # Project
 model/.cache/
 *.csv
+!driver_cost_history.csv
+!constructor_cost_history.csv
+!budget_cap_history.csv
 optimal_team.json
 backtest_results.csv
 

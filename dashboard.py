@@ -1,8 +1,9 @@
 """
-F1 Fantasy Dashboard — Australia GP 2026
+F1 Fantasy Dashboard — Miami GP 2026
 Run with:  streamlit run dashboard.py
 """
 
+import json
 import sys
 import pandas as pd
 import plotly.graph_objects as go
@@ -17,16 +18,23 @@ from backtest    import (
     run_backtest,
     CURRENT_DRIVER_COSTS,
     CURRENT_CONSTRUCTOR_COSTS,
+    CURRENT_BUDGET_CAP,
+    CURRENT_COST_SNAPSHOT,
 )
-from pipeline    import (DEFAULT_TRAIN_SEASONS, build_weekend_summary_df,
+from pricing     import get_available_cost_snapshots, load_cost_snapshot
+from pipeline    import (DEFAULT_TRAIN_SEASONS, build_constructor_season_progress_df,
+                         build_driver_season_progress_df, build_weekend_summary_df,
+                         run_predictive_model_comparison_pipeline,
                          run_optimisation_pipeline, run_predictive_backtest_pipeline,
                          run_predictive_pipeline)
+from predictive_model import (DEFAULT_COMPARISON_MODELS, FEATURE_LABELS,
+                              MODEL_LABELS, get_model_default_params)
 from value_model import CIRCUIT_ALIAS
 
 # ── constants ─────────────────────────────────────────────────────────────────
-TARGET_CIRCUIT   = "Albert Park Grand Prix Circuit"
+TARGET_CIRCUIT   = "Miami International Autodrome"
 CURRENT_SEASON   = 2026
-BUDGET           = 100.0
+BUDGET           = CURRENT_BUDGET_CAP
 AVAILABLE_SEASONS = [2022, 2023, 2024, 2025, 2026]
 AVAILABLE_CIRCUITS = sorted({circuit for values in CIRCUIT_ALIAS.values() for circuit in values})
 PLOT_BG = "rgba(0,0,0,0)"
@@ -73,12 +81,134 @@ TEAM_COLORS = {
     "Cadillac"        : "#333333",
 }
 
+BASELINE_FEATURE_OPTIONS = ["recent_form_5", "recent_form_3", "track_history", "season_avg"]
+BLEND_MODEL_OPTIONS = [
+    "blend_baseline_elastic_net",
+    "blend_baseline_gradient_boosting",
+]
+TEAM_HISTORY_PATH = Path(__file__).parent / "team_history.csv"
+TEAM_HISTORY_COLUMNS = [
+    "season", "round", "race_name",
+    "driver_1", "driver_2", "driver_3", "driver_4", "driver_5",
+    "constructor_1", "constructor_2", "notes",
+]
 
-def expand_team_exclusions(selected_teams, driver_team_map):
+
+def build_predictive_model_configs(selected_model_type, selected_model_params):
+    configs = {
+        model_type: get_model_default_params(model_type)
+        for model_type in MODEL_LABELS
+    }
+    configs[selected_model_type] = dict(selected_model_params)
+    return configs
+
+
+def format_model_params_text(params_json):
+    params = json.loads(params_json)
+    if not params:
+        return "default"
+    return ", ".join(f"{key}={value}" for key, value in params.items())
+
+
+def build_blend_weight_grid(start, stop, step):
+    weights = []
+    current = float(start)
+    while current <= float(stop) + 1e-9:
+        weights.append(round(current, 2))
+        current += float(step)
+    return sorted(set(weights))
+
+
+def load_team_history() -> pd.DataFrame:
+    if not TEAM_HISTORY_PATH.exists():
+        return pd.DataFrame(columns=TEAM_HISTORY_COLUMNS)
+
+    team_history_df = pd.read_csv(TEAM_HISTORY_PATH)
+    for column in TEAM_HISTORY_COLUMNS:
+        if column not in team_history_df.columns:
+            team_history_df[column] = ""
+    return team_history_df[TEAM_HISTORY_COLUMNS].copy()
+
+
+def snapshot_label(row: pd.Series) -> str:
+    return f"{int(row['season'])} R{int(row['round'])} {row['race_name']}"
+
+
+def build_snapshot_options(team_history_df: pd.DataFrame) -> list[str]:
+    if team_history_df.empty:
+        return []
+    ordered = team_history_df.sort_values(["season", "round"]).reset_index(drop=True)
+    return [snapshot_label(row) for _, row in ordered.iterrows()]
+
+
+def get_snapshot_row(team_history_df: pd.DataFrame, label: str | None) -> pd.Series | None:
+    if team_history_df.empty or not label:
+        return None
+    ordered = team_history_df.sort_values(["season", "round"]).reset_index(drop=True)
+    for _, row in ordered.iterrows():
+        if snapshot_label(row) == label:
+            return row
+    return None
+
+
+def row_to_team_lists(row: pd.Series | None) -> tuple[list[str], list[str]]:
+    if row is None:
+        return [], []
+    drivers = [
+        str(row.get(f"driver_{idx}", "")).strip()
+        for idx in range(1, 6)
+        if str(row.get(f"driver_{idx}", "")).strip()
+    ]
+    constructors = [
+        str(row.get(f"constructor_{idx}", "")).strip()
+        for idx in range(1, 3)
+        if str(row.get(f"constructor_{idx}", "")).strip()
+    ]
+    return drivers, constructors
+
+
+def save_team_snapshot(
+    season: int,
+    round_number: int,
+    race_name: str,
+    drivers: list[str],
+    constructors: list[str],
+    notes: str = "",
+) -> None:
+    team_history_df = load_team_history()
+    padded_drivers = list(drivers[:5]) + [""] * max(0, 5 - len(drivers))
+    padded_constructors = list(constructors[:2]) + [""] * max(0, 2 - len(constructors))
+    new_row = {
+        "season": int(season),
+        "round": int(round_number),
+        "race_name": race_name.strip(),
+        "driver_1": padded_drivers[0],
+        "driver_2": padded_drivers[1],
+        "driver_3": padded_drivers[2],
+        "driver_4": padded_drivers[3],
+        "driver_5": padded_drivers[4],
+        "constructor_1": padded_constructors[0],
+        "constructor_2": padded_constructors[1],
+        "notes": notes.strip(),
+    }
+
+    if not team_history_df.empty:
+        mask = (
+            (team_history_df["season"].astype(int) == int(season))
+            & (team_history_df["round"].astype(int) == int(round_number))
+        )
+        team_history_df = team_history_df.loc[~mask].copy()
+
+    team_history_df = pd.concat([team_history_df, pd.DataFrame([new_row])], ignore_index=True)
+    team_history_df = team_history_df.sort_values(["season", "round"]).reset_index(drop=True)
+    team_history_df.to_csv(TEAM_HISTORY_PATH, index=False)
+
+
+def expand_team_exclusions(selected_teams, driver_team_map, constructor_names):
     excluded_drivers = sorted(
         driver for driver, team in driver_team_map.items() if team in selected_teams
     )
-    excluded_constructors = sorted(team for team in selected_teams if team in CURRENT_CONSTRUCTOR_COSTS)
+    excluded_constructors = sorted(team for team in selected_teams if team in constructor_names)
     return excluded_drivers, excluded_constructors
 
 
@@ -88,8 +218,11 @@ def build_effective_exclusions(
     news_excluded_constructors,
     news_excluded_teams,
     driver_team_map,
+    constructor_names,
 ):
-    team_drivers, team_constructors = expand_team_exclusions(news_excluded_teams, driver_team_map)
+    team_drivers, team_constructors = expand_team_exclusions(
+        news_excluded_teams, driver_team_map, constructor_names
+    )
     effective = sorted(
         set(manual_excluded)
         | set(news_excluded_drivers)
@@ -100,9 +233,14 @@ def build_effective_exclusions(
     return effective, team_drivers, team_constructors
 
 
+def filter_defaults(default_values, options):
+    option_set = set(options)
+    return [value for value in default_values if value in option_set]
+
+
 # ── page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="F1 Fantasy | Australia GP 2026",
+    page_title="F1 Fantasy | Miami GP 2026",
     page_icon="🏎️",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -122,9 +260,38 @@ st.markdown("""
 
 # ── sidebar — model controls ───────────────────────────────────────────────────
 with st.sidebar:
+    team_history_df = load_team_history()
+    team_snapshot_options = build_snapshot_options(team_history_df)
+    default_snapshot_label = team_snapshot_options[-1] if team_snapshot_options else None
+    selected_snapshot_label = st.selectbox(
+        "Baseline team from CSV",
+        options=team_snapshot_options,
+        index=len(team_snapshot_options) - 1 if team_snapshot_options else None,
+        help="Loads your current team baseline from team_history.csv",
+    ) if team_snapshot_options else None
+    selected_snapshot_row = get_snapshot_row(team_history_df, selected_snapshot_label)
+    default_current_drivers, default_current_constructors = row_to_team_lists(selected_snapshot_row)
+
     st.title("⚙️ Model Controls")
     st.markdown("---")
     st.subheader("Race Setup")
+    cost_snapshot_options = get_available_cost_snapshots()
+    selected_cost_snapshot = st.selectbox(
+        "Cost snapshot",
+        options=cost_snapshot_options,
+        index=cost_snapshot_options.index(CURRENT_COST_SNAPSHOT)
+        if CURRENT_COST_SNAPSHOT in cost_snapshot_options else len(cost_snapshot_options) - 1,
+        help="Choose which saved price snapshot the optimizer should use.",
+    )
+    selected_driver_costs, selected_constructor_costs, selected_budget_cap, selected_cost_snapshot = load_cost_snapshot(
+        selected_cost_snapshot
+    )
+    previous_cost_snapshot = st.session_state.get("_selected_cost_snapshot")
+    if "budget_cap_input" not in st.session_state or previous_cost_snapshot != selected_cost_snapshot:
+        st.session_state["budget_cap_input"] = float(selected_budget_cap)
+    st.session_state["_selected_cost_snapshot"] = selected_cost_snapshot
+    driver_cost_options = list(selected_driver_costs.keys())
+    constructor_cost_options = list(selected_constructor_costs.keys())
     model_mode = st.radio("Model type", [PREDICTIVE_MODE, HEURISTIC_MODE], index=0)
     current_season = st.selectbox("Current season", AVAILABLE_SEASONS,
                                   index=AVAILABLE_SEASONS.index(CURRENT_SEASON))
@@ -139,8 +306,98 @@ with st.sidebar:
     st.markdown("---")
     if model_mode == PREDICTIVE_MODE:
         st.subheader("Predictive Model Settings")
-        ridge_alpha = st.slider("Regularisation strength", 0.1, 20.0, 5.0, 0.1,
-                                help="Higher values shrink coefficients and reduce overfitting.")
+        predictive_model_type = st.selectbox(
+            "Model family",
+            options=list(MODEL_LABELS.keys()),
+            index=list(MODEL_LABELS.keys()).index("ridge"),
+            format_func=lambda key: MODEL_LABELS[key],
+            help="Try different regression families on the same engineered driver-race dataset.",
+        )
+        predictive_model_params = get_model_default_params(predictive_model_type)
+        if predictive_model_type == "ridge":
+            ridge_alpha = st.slider("Regularisation strength", 0.1, 20.0, float(predictive_model_params["alpha"]), 0.1,
+                                    help="Higher values shrink coefficients and reduce overfitting.")
+            predictive_model_params["alpha"] = ridge_alpha
+        elif predictive_model_type == "elastic_net":
+            elastic_alpha = st.slider("Elastic Net alpha", 0.01, 5.0, float(predictive_model_params["alpha"]), 0.01,
+                                      help="Overall regularisation strength.")
+            elastic_l1_ratio = st.slider("Elastic Net l1 ratio", 0.0, 1.0, float(predictive_model_params["l1_ratio"]), 0.05,
+                                         help="0 behaves more like ridge, 1 behaves more like lasso.")
+            predictive_model_params["alpha"] = elastic_alpha
+            predictive_model_params["l1_ratio"] = elastic_l1_ratio
+        elif predictive_model_type == "random_forest":
+            rf_estimators = st.slider("Random forest trees", 50, 500, int(predictive_model_params["n_estimators"]), 25)
+            rf_max_depth_choice = st.selectbox(
+                "Random forest max depth",
+                options=["None", 2, 3, 4, 5, 6, 8, 10],
+                index=["None", 2, 3, 4, 5, 6, 8, 10].index(
+                    "None" if predictive_model_params["max_depth"] is None else predictive_model_params["max_depth"]
+                ),
+                help="Limit tree depth to reduce overfitting on a small dataset.",
+            )
+            rf_min_samples_leaf = st.slider("Random forest min samples per leaf", 1, 8, int(predictive_model_params["min_samples_leaf"]), 1)
+            predictive_model_params["n_estimators"] = rf_estimators
+            predictive_model_params["max_depth"] = None if rf_max_depth_choice == "None" else int(rf_max_depth_choice)
+            predictive_model_params["min_samples_leaf"] = rf_min_samples_leaf
+        elif predictive_model_type == "gradient_boosting":
+            gb_estimators = st.slider("Boosting stages", 50, 500, int(predictive_model_params["n_estimators"]), 25)
+            gb_learning_rate = st.slider("Learning rate", 0.01, 0.30, float(predictive_model_params["learning_rate"]), 0.01)
+            gb_max_depth = st.slider("Boosting tree depth", 1, 5, int(predictive_model_params["max_depth"]), 1)
+            gb_min_samples_leaf = st.slider("Boosting min samples per leaf", 1, 8, int(predictive_model_params["min_samples_leaf"]), 1)
+            predictive_model_params["n_estimators"] = gb_estimators
+            predictive_model_params["learning_rate"] = gb_learning_rate
+            predictive_model_params["max_depth"] = gb_max_depth
+            predictive_model_params["min_samples_leaf"] = gb_min_samples_leaf
+        elif predictive_model_type == "blend_baseline_elastic_net":
+            blend_weight = st.slider(
+                "Elastic Net blend weight",
+                0.0, 1.0, float(predictive_model_params["blend_weight"]), 0.05,
+                help="0 = pure baseline, 1 = pure Elastic Net.",
+            )
+            baseline_feature = st.selectbox(
+                "Baseline signal",
+                options=BASELINE_FEATURE_OPTIONS,
+                index=BASELINE_FEATURE_OPTIONS.index(predictive_model_params["baseline_feature"]),
+                format_func=lambda key: FEATURE_LABELS.get(key, key),
+            )
+            elastic_alpha = st.slider("Elastic Net alpha", 0.01, 5.0, float(predictive_model_params["alpha"]), 0.01)
+            elastic_l1_ratio = st.slider("Elastic Net l1 ratio", 0.0, 1.0, float(predictive_model_params["l1_ratio"]), 0.05)
+            predictive_model_params["blend_weight"] = blend_weight
+            predictive_model_params["baseline_feature"] = baseline_feature
+            predictive_model_params["alpha"] = elastic_alpha
+            predictive_model_params["l1_ratio"] = elastic_l1_ratio
+        elif predictive_model_type == "blend_baseline_gradient_boosting":
+            blend_weight = st.slider(
+                "Boosting blend weight",
+                0.0, 1.0, float(predictive_model_params["blend_weight"]), 0.05,
+                help="0 = pure baseline, 1 = pure Gradient Boosting.",
+            )
+            baseline_feature = st.selectbox(
+                "Baseline signal",
+                options=BASELINE_FEATURE_OPTIONS,
+                index=BASELINE_FEATURE_OPTIONS.index(predictive_model_params["baseline_feature"]),
+                format_func=lambda key: FEATURE_LABELS.get(key, key),
+            )
+            gb_estimators = st.slider("Boosting stages", 50, 500, int(predictive_model_params["n_estimators"]), 25)
+            gb_learning_rate = st.slider("Learning rate", 0.01, 0.30, float(predictive_model_params["learning_rate"]), 0.01)
+            gb_max_depth = st.slider("Boosting tree depth", 1, 5, int(predictive_model_params["max_depth"]), 1)
+            gb_min_samples_leaf = st.slider("Boosting min samples per leaf", 1, 8, int(predictive_model_params["min_samples_leaf"]), 1)
+            predictive_model_params["blend_weight"] = blend_weight
+            predictive_model_params["baseline_feature"] = baseline_feature
+            predictive_model_params["n_estimators"] = gb_estimators
+            predictive_model_params["learning_rate"] = gb_learning_rate
+            predictive_model_params["max_depth"] = gb_max_depth
+            predictive_model_params["min_samples_leaf"] = gb_min_samples_leaf
+        else:
+            baseline_feature = st.selectbox(
+                "Baseline signal",
+                options=BASELINE_FEATURE_OPTIONS,
+                index=BASELINE_FEATURE_OPTIONS.index(predictive_model_params["baseline_feature"]),
+                format_func=lambda key: FEATURE_LABELS.get(key, key),
+                help="Simple benchmark that predicts points from a single existing signal.",
+            )
+            predictive_model_params["baseline_feature"] = baseline_feature
+
         min_history_weekends = st.slider("Minimum history before training", 3, 12, 5, 1,
                                          help="Backtests and training examples only start after this many prior weekends.")
         current_season_boost = st.slider(
@@ -153,6 +410,42 @@ with st.sidebar:
             0.3, 1.0, 0.8, 0.05,
             help="Lower values downweight older seasons more aggressively to reflect rule changes."
         )
+        comparison_model_types = st.multiselect(
+            "Compare model families",
+            options=list(MODEL_LABELS.keys()),
+            default=list(DEFAULT_COMPARISON_MODELS),
+            format_func=lambda key: MODEL_LABELS[key],
+            help="Run the expanding-window backtest side by side for these model families.",
+        )
+        st.markdown("**Blend weight sweep**")
+        run_blend_sweep = st.toggle(
+            "Run automatic blend-weight sweep",
+            value=False,
+            help="Backtest several blend weights in one go for the selected blend family.",
+        )
+        blend_sweep_model_type = st.selectbox(
+            "Blend family to sweep",
+            options=BLEND_MODEL_OPTIONS,
+            index=BLEND_MODEL_OPTIONS.index("blend_baseline_gradient_boosting"),
+            format_func=lambda key: MODEL_LABELS[key],
+            disabled=not run_blend_sweep,
+        )
+        blend_sweep_start = st.slider(
+            "Sweep start weight",
+            0.1, 0.9, 0.2, 0.05,
+            disabled=not run_blend_sweep,
+        )
+        blend_sweep_end = st.slider(
+            "Sweep end weight",
+            0.1, 0.9, 0.8, 0.05,
+            disabled=not run_blend_sweep,
+        )
+        blend_sweep_step = st.slider(
+            "Sweep step",
+            0.05, 0.25, 0.15, 0.05,
+            disabled=not run_blend_sweep,
+        )
+        st.caption("Default predictive presets are tuned from a recent full-season backtest and can still be adjusted manually.")
         w_recent, w_track, w_ppm, w_quali = 0.35, 0.30, 0.15, 0.20
     else:
         st.subheader("Signal Weights")
@@ -163,6 +456,14 @@ with st.sidebar:
         total_w  = w_recent + w_track + w_ppm + w_quali
         st.caption(f"Weight total: **{total_w:.2f}** {'✅' if abs(total_w - 1.0) < 0.01 else '⚠️ (auto-normalised)'}")
         ridge_alpha = 5.0
+        predictive_model_type = "ridge"
+        predictive_model_params = get_model_default_params("ridge")
+        comparison_model_types = list(DEFAULT_COMPARISON_MODELS)
+        run_blend_sweep = False
+        blend_sweep_model_type = "blend_baseline_gradient_boosting"
+        blend_sweep_start = 0.2
+        blend_sweep_end = 0.8
+        blend_sweep_step = 0.15
         min_history_weekends = 5
         current_season_boost = 3.0
         season_decay = 0.8
@@ -173,44 +474,100 @@ with st.sidebar:
 
     st.markdown("---")
     st.subheader("Team Constraints")
+    use_transfer_penalty = st.toggle(
+        "Model transfer cost",
+        value=True,
+        help="Applies the F1 Fantasy transfer penalty to the optimizer objective.",
+    )
+    current_drivers = st.multiselect(
+        "Current drivers",
+        options=driver_cost_options,
+        default=default_current_drivers,
+        help="Your current five drivers before making this week's transfers.",
+    )
+    current_constructors = st.multiselect(
+        "Current constructors",
+        options=constructor_cost_options,
+        default=default_current_constructors,
+        help="Your current two constructors before making this week's transfers.",
+    )
+    free_transfers = st.selectbox(
+        "Free transfers available",
+        options=[0, 1, 2, 3],
+        index=2,
+        help="Official game default is 2, with one unused transfer able to roll over.",
+        disabled=not use_transfer_penalty,
+    )
     locked = st.multiselect("🔒 Lock drivers",
-                             options=list(CURRENT_DRIVER_COSTS.keys()))
+                             options=driver_cost_options)
     excluded = st.multiselect("🚫 Exclude drivers/constructors",
-                               options=list(CURRENT_DRIVER_COSTS.keys()) +
-                                       list(CURRENT_CONSTRUCTOR_COSTS.keys()),
+                               options=driver_cost_options + constructor_cost_options,
                                help="Directly remove individual drivers or constructors from the optimizer pool.")
     news_excluded_teams = st.multiselect(
         "🚫 Exclude teams",
-        options=sorted(CURRENT_CONSTRUCTOR_COSTS.keys()),
+        options=sorted(constructor_cost_options),
         help="Removes the constructor and all drivers mapped to that team from consideration.",
     )
     st.caption("Team exclusions are applied before optimization, just like driver exclusions.")
     st.markdown("**Optional news-driven filters**")
     news_excluded_drivers = st.multiselect(
         "Exclude extra drivers from news",
-        options=list(CURRENT_DRIVER_COSTS.keys()),
-        default=["Fernando Alonso", "Lance Stroll"],
+        options=driver_cost_options,
+        default=[],
         help="Useful for team issues, expected poor pace, penalties, injuries, or reliability concerns.",
     )
     news_excluded_constructors = st.multiselect(
         "Exclude extra constructors from news",
-        options=list(CURRENT_CONSTRUCTOR_COSTS.keys()),
+        options=constructor_cost_options,
         help="Use this when the whole constructor should be removed from the pool.",
     )
     news_reason = st.text_area(
         "News note",
-        value="Aston Martin look weak on current pace, so exclude Alonso and Stroll.",
+        value="",
         height=70,
         help="Optional context for why these exclusions are active.",
     )
-    budget_cap = st.number_input("💵 Budget ($M)", value=100.0, min_value=50.0,
-                                  max_value=200.0, step=1.0)
+    budget_cap = st.number_input("💵 Budget ($M)", key="budget_cap_input", min_value=50.0,
+                                  max_value=200.0, step=0.1,
+                                  help="Defaults to the selected cost snapshot's saved budget cap.")
+    transfer_penalty_points = 10.0 if use_transfer_penalty else 0.0
+
+    st.markdown("---")
+    st.subheader("Save Team History")
+    save_team_season = st.selectbox(
+        "Save season",
+        options=AVAILABLE_SEASONS,
+        index=AVAILABLE_SEASONS.index(current_season),
+        help="Season to write into team_history.csv",
+    )
+    default_save_round = int(selected_snapshot_row["round"]) if selected_snapshot_row is not None else 1
+    save_team_round = st.number_input(
+        "Save round",
+        min_value=1,
+        max_value=30,
+        value=default_save_round,
+        step=1,
+        help="Round number for this saved team snapshot.",
+    )
+    default_race_name = str(selected_snapshot_row["race_name"]) if selected_snapshot_row is not None else ""
+    save_team_race_name = st.text_input(
+        "Save race name",
+        value=default_race_name,
+        help="Race name stored alongside the lineup in the CSV.",
+    )
+    save_team_notes = st.text_input(
+        "Save note",
+        value="",
+        help="Optional note for later reference.",
+    )
+    save_team_clicked = st.button("Save current team to CSV", use_container_width=True)
 
     st.markdown("---")
     st.subheader("Backtest")
     bt_seasons = st.multiselect("Seasons", AVAILABLE_SEASONS,
                                  default=DEFAULT_TRAIN_SEASONS)
     bt_circuit = st.selectbox("Circuit", ["all", "australia", "singapore",
+                                           "china", "japan", "miami",
                                            "las vegas", "qatar", "abu dhabi",
                                            "brazil", "mexico", "usa"])
     run_bt = st.button("▶ Run Backtest", use_container_width=True)
@@ -245,17 +602,55 @@ effective_excluded, team_excluded_drivers, team_excluded_constructors = build_ef
     news_excluded_constructors=news_excluded_constructors,
     news_excluded_teams=news_excluded_teams,
     driver_team_map=DRIVER_TEAM_2026,
+    constructor_names=constructor_cost_options,
 )
 effective_locked = [driver for driver in locked if driver not in effective_excluded]
+predictive_model_params_json = json.dumps(predictive_model_params, sort_keys=True)
+selected_driver_costs_json = json.dumps(selected_driver_costs, sort_keys=True)
+selected_constructor_costs_json = json.dumps(selected_constructor_costs, sort_keys=True)
+comparison_model_configs_json = json.dumps(
+    build_predictive_model_configs(predictive_model_type, predictive_model_params),
+    sort_keys=True,
+)
+blend_sweep_weights = build_blend_weight_grid(
+    min(blend_sweep_start, blend_sweep_end),
+    max(blend_sweep_start, blend_sweep_end),
+    blend_sweep_step,
+)
+
+if save_team_clicked:
+    if len(current_drivers) != 5 or len(current_constructors) != 2 or not save_team_race_name.strip():
+        st.error(
+            "To save a team snapshot, select exactly 5 drivers, 2 constructors, and enter a race name."
+        )
+    else:
+        save_team_snapshot(
+            season=save_team_season,
+            round_number=int(save_team_round),
+            race_name=save_team_race_name,
+            drivers=current_drivers,
+            constructors=current_constructors,
+            notes=save_team_notes,
+        )
+        st.success(
+            f"Saved team snapshot to {TEAM_HISTORY_PATH.name}: "
+            f"{save_team_season} R{int(save_team_round)} {save_team_race_name}."
+        )
 
 
 # ── data loading & model (cached) ─────────────────────────────────────────────
 @st.cache_data(show_spinner="Running model...", ttl=60)
 def run_model(model_mode, train_seasons_tuple, current_season, target_circuit,
               w_r, w_t, w_p, w_q, use_bonus, include_current,
-              locked_d, excl, bdgt, ridge_alpha, min_history_weekends,
-              current_season_boost, season_decay):
+              locked_d, excl, bdgt, predictive_model_type, predictive_model_params_json,
+              min_history_weekends, current_season_boost, season_decay,
+              current_drivers_tuple, current_constructors_tuple,
+              free_transfers, transfer_penalty_points,
+              driver_costs_json, constructor_costs_json):
+    resolved_driver_costs = json.loads(driver_costs_json)
+    resolved_constructor_costs = json.loads(constructor_costs_json)
     if model_mode == PREDICTIVE_MODE:
+        predictive_model_params = json.loads(predictive_model_params_json)
         output = run_predictive_pipeline(
             train_seasons=list(train_seasons_tuple),
             current_season=current_season,
@@ -266,7 +661,14 @@ def run_model(model_mode, train_seasons_tuple, current_season, target_circuit,
             include_current_season=include_current,
             locked_drivers=list(locked_d),
             excluded=list(excl),
-            alpha=ridge_alpha,
+            current_drivers=list(current_drivers_tuple),
+            current_constructors=list(current_constructors_tuple),
+            free_transfers=free_transfers,
+            transfer_penalty=transfer_penalty_points,
+            driver_costs=resolved_driver_costs,
+            constructor_costs=resolved_constructor_costs,
+            model_type=predictive_model_type,
+            model_params=predictive_model_params,
             min_history_weekends=min_history_weekends,
             current_season_boost=current_season_boost,
             season_decay=season_decay,
@@ -291,6 +693,12 @@ def run_model(model_mode, train_seasons_tuple, current_season, target_circuit,
         include_current_season=include_current,
         locked_drivers=list(locked_d),
         excluded=list(excl),
+        current_drivers=list(current_drivers_tuple),
+        current_constructors=list(current_constructors_tuple),
+        free_transfers=free_transfers,
+        transfer_penalty=transfer_penalty_points,
+        driver_costs=resolved_driver_costs,
+        constructor_costs=resolved_constructor_costs,
     )
     output["model_mode"] = "heuristic"
     return output
@@ -298,16 +706,19 @@ def run_model(model_mode, train_seasons_tuple, current_season, target_circuit,
 
 @st.cache_data(show_spinner="Running backtest...")
 def cached_backtest(model_mode, seasons_tuple, current_season, circuit, use_bonus,
-                    budget_m, w_r, w_t, w_p, w_q, ridge_alpha, min_history_weekends,
+                    budget_m, w_r, w_t, w_p, w_q, predictive_model_type, predictive_model_params_json,
+                    min_history_weekends,
                     current_season_boost, season_decay):
     if model_mode == PREDICTIVE_MODE:
+        predictive_model_params = json.loads(predictive_model_params_json)
         return run_predictive_backtest_pipeline(
             seasons=list(seasons_tuple),
             current_season=current_season,
             target_circuit=circuit,
             include_current_season=False,
             budget_m=budget_m,
-            alpha=ridge_alpha,
+            model_type=predictive_model_type,
+            model_params=predictive_model_params,
             min_history_weekends=min_history_weekends,
             current_season_boost=current_season_boost,
             season_decay=season_decay,
@@ -331,6 +742,75 @@ def cached_backtest(model_mode, seasons_tuple, current_season, circuit, use_bonu
     return bt_df, pd.DataFrame()
 
 
+@st.cache_data(show_spinner="Comparing predictive models...")
+def cached_model_comparison(seasons_tuple, current_season, circuit, comparison_model_types_tuple,
+                            comparison_model_configs_json, budget_m, min_history_weekends,
+                            current_season_boost, season_decay):
+    comparison_model_configs = json.loads(comparison_model_configs_json)
+    return run_predictive_model_comparison_pipeline(
+        seasons=list(seasons_tuple),
+        current_season=current_season,
+        target_circuit=circuit,
+        model_types=list(comparison_model_types_tuple),
+        model_param_overrides=comparison_model_configs,
+        include_current_season=False,
+        budget_m=budget_m,
+        min_history_weekends=min_history_weekends,
+        current_season_boost=current_season_boost,
+        season_decay=season_decay,
+    )
+
+
+@st.cache_data(show_spinner="Sweeping blend weights...")
+def cached_blend_weight_sweep(seasons_tuple, current_season, circuit, blend_model_type,
+                              blend_weights_tuple, blend_base_params_json, budget_m,
+                              min_history_weekends, current_season_boost, season_decay):
+    base_params = json.loads(blend_base_params_json)
+    rows = []
+    detail_frames = []
+
+    for blend_weight in blend_weights_tuple:
+        model_params = dict(base_params)
+        model_params["blend_weight"] = float(blend_weight)
+        bt_df, _ = run_predictive_backtest_pipeline(
+            seasons=list(seasons_tuple),
+            current_season=current_season,
+            target_circuit=circuit,
+            include_current_season=False,
+            budget_m=budget_m,
+            model_type=blend_model_type,
+            model_params=model_params,
+            min_history_weekends=min_history_weekends,
+            current_season_boost=current_season_boost,
+            season_decay=season_decay,
+        )
+        if not bt_df.empty:
+            bt_df = bt_df.copy()
+            bt_df["blend_weight"] = float(blend_weight)
+            detail_frames.append(bt_df)
+
+        rows.append(
+            {
+                "blend_weight": float(blend_weight),
+                "races_evaluated": int(len(bt_df)),
+                "avg_efficiency_pct": round(float(bt_df["efficiency_pct"].mean()), 2)
+                if not bt_df.empty else None,
+                "median_efficiency_pct": round(float(bt_df["efficiency_pct"].median()), 2)
+                if not bt_df.empty else None,
+                "avg_driver_mae": round(float(bt_df["driver_mae"].mean()), 3)
+                if not bt_df.empty else None,
+                "median_driver_mae": round(float(bt_df["driver_mae"].median()), 3)
+                if not bt_df.empty else None,
+            }
+        )
+
+    sweep_df = pd.DataFrame(rows)
+    if not sweep_df.empty:
+        sweep_df = sweep_df.sort_values("blend_weight").reset_index(drop=True)
+    detail_df = pd.concat(detail_frames, ignore_index=True) if detail_frames else pd.DataFrame()
+    return sweep_df, detail_df
+
+
 # ── run model ─────────────────────────────────────────────────────────────────
 model_output = run_model(
     model_mode,
@@ -340,7 +820,11 @@ model_output = run_model(
     w_recent, w_track, w_ppm, w_quali,
     use_bonus, include_current_season,
     tuple(effective_locked), tuple(effective_excluded), budget_cap,
-    ridge_alpha, min_history_weekends, current_season_boost, season_decay
+    predictive_model_type, predictive_model_params_json,
+    min_history_weekends, current_season_boost, season_decay,
+    tuple(current_drivers), tuple(current_constructors),
+    free_transfers, transfer_penalty_points,
+    selected_driver_costs_json, selected_constructor_costs_json,
 )
 d_scores = model_output["driver_scores_df"]
 c_scores = model_output["constructor_scores_df"]
@@ -353,7 +837,12 @@ trained_model = model_output.get("model")
 training_examples_df = model_output.get("training_examples_df", pd.DataFrame())
 feature_columns = model_output.get("feature_columns", [])
 diagnostics = model_output["diagnostics"]
+selected_model_type = model_output.get("model_type", predictive_model_type)
+selected_model_label = model_output.get("model_label", MODEL_LABELS.get(selected_model_type, selected_model_type))
+selected_model_params = model_output.get("model_params", predictive_model_params)
 weekend_summary_df = build_weekend_summary_df(training_weekends)
+driver_season_progress_df = build_driver_season_progress_df(history_df, current_season)
+constructor_season_progress_df = build_constructor_season_progress_df(training_weekends, current_season)
 is_predictive = model_output["model_mode"] == "predictive"
 primary_score_col = "predicted_points" if is_predictive else "norm_score"
 primary_score_label = "Predicted Pts" if is_predictive else "Model Score"
@@ -364,19 +853,25 @@ picked_constructors = list(opt_result["constructors"]["constructor"])
 # ── header ────────────────────────────────────────────────────────────────────
 st.title("🏎️  F1 Fantasy Model")
 st.caption(
-    f"{model_mode} · {target_circuit} · {current_season} season context · "
+    f"{model_mode}"
+    + (f" ({selected_model_label})" if is_predictive else "")
+    + f" · {target_circuit} · {current_season} season context · "
     f"training seasons: {', '.join(map(str, sorted(set(train_seasons))))}"
     + (" + current season" if include_current_season else "")
+    + f" · costs: {selected_cost_snapshot}"
 )
 
 # ── top KPI row ───────────────────────────────────────────────────────────────
-k1, k2, k3, k4, k5 = st.columns(5)
+k1, k2, k3, k4, k5, k6 = st.columns(6)
 k1.metric("Budget Used",  f"${opt_result['total_cost']:.1f}M",
            f"${budget_cap - opt_result['total_cost']:.1f}M remaining")
-k2.metric(primary_score_label,  f"{opt_result['total_score']:.3f}")
+k2.metric(primary_score_label,  f"{opt_result['base_score']:.3f}")
 k3.metric("Drivers",      f"{len(picked_drivers)} / 5")
 k4.metric("Constructors", f"{len(picked_constructors)} / 2")
-k5.metric("Training Races", f"{len(training_weekends)}")
+k5.metric("Transfers", f"{opt_result['transfer_count']}",
+          f"{opt_result['paid_transfers']} paid")
+k6.metric("After Transfer Cost", f"{opt_result['total_score']:.3f}",
+          f"-{opt_result['transfer_cost']:.1f}" if opt_result["transfer_cost"] > 0 else "no penalty")
 
 st.markdown("---")
 
@@ -401,9 +896,15 @@ if len(effective_locked) < len(locked):
         + ", ".join(removed_locks)
     )
 
+if use_transfer_penalty and (len(current_drivers) != 5 or len(current_constructors) != 2):
+    st.warning(
+        "Transfer modelling expects 5 current drivers and 2 current constructors. "
+        "The optimizer will still run, but the transfer count will be based on the selections above."
+    )
+
 # ── TABS ──────────────────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-    "🏆 Optimal Team", "📊 Driver Rankings", "🔁 Backtest",
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    "🏆 Optimal Team", "📊 Driver Rankings", "📈 Season Tracker", "🔁 Backtest",
     "🔬 Signal Explorer", "🗂 Data Tables", "📘 How It Works"
 ])
 
@@ -415,6 +916,29 @@ with tab1:
     col_left, col_right = st.columns([1, 1])
 
     with col_left:
+        st.subheader("Transfer Plan")
+        transfer_rows = []
+        for name in opt_result["incoming_drivers"]:
+            transfer_rows.append({"Move": "IN", "Type": "Driver", "Name": name})
+        for name in opt_result["outgoing_drivers"]:
+            transfer_rows.append({"Move": "OUT", "Type": "Driver", "Name": name})
+        for name in opt_result["incoming_constructors"]:
+            transfer_rows.append({"Move": "IN", "Type": "Constructor", "Name": name})
+        for name in opt_result["outgoing_constructors"]:
+            transfer_rows.append({"Move": "OUT", "Type": "Constructor", "Name": name})
+
+        transfer_summary = (
+            f"{opt_result['transfer_count']} total transfers, "
+            f"{opt_result['free_transfers']} free, "
+            f"{opt_result['paid_transfers']} paid, "
+            f"{opt_result['transfer_cost']:.1f} point cost."
+        )
+        st.caption(transfer_summary)
+        if transfer_rows:
+            st.dataframe(pd.DataFrame(transfer_rows), use_container_width=True, hide_index=True)
+        else:
+            st.success("No changes needed from your current team.")
+
         st.subheader("Selected Drivers")
         if is_predictive:
             d_display = opt_result["drivers"][[
@@ -622,16 +1146,504 @@ with tab2:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TAB 3 — BACKTEST
+# TAB 3 — SEASON TRACKER
 # ═══════════════════════════════════════════════════════════════════════════════
 with tab3:
+    st.subheader(f"{current_season} Fantasy Points Tracker")
+
+    if driver_season_progress_df.empty:
+        st.info("No current-season fantasy points are loaded yet.")
+    else:
+        latest_driver_totals = (
+            driver_season_progress_df.sort_values(["driver_name", "round"])
+            .groupby("driver_name", as_index=False)
+            .tail(1)
+            .sort_values("cumulative_fantasy_pts", ascending=False)
+            .reset_index(drop=True)
+        )
+        default_driver_tracker = picked_drivers or latest_driver_totals["driver_name"].head(8).tolist()
+        driver_tracker_options = latest_driver_totals["driver_name"].tolist()
+        selected_driver_tracker = st.multiselect(
+            "Drivers to track",
+            options=driver_tracker_options,
+            default=filter_defaults(default_driver_tracker, driver_tracker_options),
+            key="season_tracker_drivers",
+        )
+        driver_view_mode = st.radio(
+            "Driver chart view",
+            ["Cumulative season points", "Per-race points"],
+            horizontal=True,
+            key="season_tracker_driver_view",
+        )
+        driver_value_col = (
+            "cumulative_fantasy_pts"
+            if driver_view_mode == "Cumulative season points"
+            else "fantasy_pts"
+        )
+        driver_yaxis_title = (
+            "Cumulative Fantasy Points"
+            if driver_view_mode == "Cumulative season points"
+            else "Fantasy Points"
+        )
+
+        driver_chart_df = driver_season_progress_df[
+            driver_season_progress_df["driver_name"].isin(selected_driver_tracker)
+        ].copy()
+        tracker_col1, tracker_col2 = st.columns([1.25, 0.75])
+
+        with tracker_col1:
+            fig_driver_tracker = go.Figure()
+            for driver_name in selected_driver_tracker:
+                driver_rows = driver_chart_df[driver_chart_df["driver_name"] == driver_name]
+                if driver_rows.empty:
+                    continue
+                team_name = driver_rows["team"].iloc[0]
+                fig_driver_tracker.add_trace(go.Scatter(
+                    x=driver_rows["race_label"],
+                    y=driver_rows[driver_value_col],
+                    mode="lines+markers",
+                    name=driver_name,
+                    line=dict(color=TEAM_COLORS.get(team_name, "#B0B7C3"), width=3),
+                    marker=dict(size=8),
+                    hovertemplate="%{x}<br>%{fullData.name}: %{y:.1f}<extra></extra>",
+                ))
+            apply_transparent_plot_layout(
+                fig_driver_tracker,
+                yaxis_title=driver_yaxis_title,
+                height=380,
+            )
+            fig_driver_tracker.update_layout(legend=dict(orientation="h", y=1.12))
+            st.plotly_chart(fig_driver_tracker, use_container_width=True)
+
+        with tracker_col2:
+            st.markdown("**Current Driver Standings**")
+            driver_totals_display = latest_driver_totals[[
+                "driver_name", "team", "fantasy_pts", "cumulative_fantasy_pts"
+            ]].copy()
+            driver_totals_display.columns = ["Driver", "Team", "Latest Race", "Season Total"]
+            st.dataframe(driver_totals_display, use_container_width=True, hide_index=True, height=380)
+
+        st.markdown("**Race-by-Race Driver Points**")
+        driver_race_display = driver_season_progress_df[[
+            "round", "race_name", "driver_name", "team", "fantasy_pts", "cumulative_fantasy_pts"
+        ]].copy()
+        driver_race_display.columns = ["Round", "Race", "Driver", "Team", "Race Pts", "Season Total"]
+        st.dataframe(driver_race_display, use_container_width=True, hide_index=True, height=280)
+
+    st.markdown("---")
+    st.subheader(f"{current_season} Constructor Fantasy Points")
+
+    if constructor_season_progress_df.empty:
+        st.info("No current-season constructor points are loaded yet.")
+    else:
+        latest_constructor_totals = (
+            constructor_season_progress_df.sort_values(["constructor", "round"])
+            .groupby("constructor", as_index=False)
+            .tail(1)
+            .sort_values("cumulative_fantasy_pts", ascending=False)
+            .reset_index(drop=True)
+        )
+        default_constructor_tracker = picked_constructors or latest_constructor_totals["constructor"].head(6).tolist()
+        constructor_tracker_options = latest_constructor_totals["constructor"].tolist()
+        selected_constructor_tracker = st.multiselect(
+            "Constructors to track",
+            options=constructor_tracker_options,
+            default=filter_defaults(default_constructor_tracker, constructor_tracker_options),
+            key="season_tracker_constructors",
+        )
+        constructor_chart_df = constructor_season_progress_df[
+            constructor_season_progress_df["constructor"].isin(selected_constructor_tracker)
+        ].copy()
+
+        constructor_col1, constructor_col2 = st.columns([1.25, 0.75])
+        with constructor_col1:
+            fig_constructor_tracker = go.Figure()
+            for constructor_name in selected_constructor_tracker:
+                constructor_rows = constructor_chart_df[
+                    constructor_chart_df["constructor"] == constructor_name
+                ]
+                if constructor_rows.empty:
+                    continue
+                fig_constructor_tracker.add_trace(go.Scatter(
+                    x=constructor_rows["race_label"],
+                    y=constructor_rows["cumulative_fantasy_pts"],
+                    mode="lines+markers",
+                    name=constructor_name,
+                    line=dict(color=TEAM_COLORS.get(constructor_name, "#B0B7C3"), width=3),
+                    marker=dict(size=8),
+                    hovertemplate="%{x}<br>%{fullData.name}: %{y:.1f}<extra></extra>",
+                ))
+            apply_transparent_plot_layout(
+                fig_constructor_tracker,
+                yaxis_title="Cumulative Fantasy Points",
+                height=320,
+            )
+            fig_constructor_tracker.update_layout(legend=dict(orientation="h", y=1.12))
+            st.plotly_chart(fig_constructor_tracker, use_container_width=True)
+
+        with constructor_col2:
+            constructor_totals_display = latest_constructor_totals[[
+                "constructor", "fantasy_pts", "cumulative_fantasy_pts"
+            ]].copy()
+            constructor_totals_display.columns = ["Constructor", "Latest Race", "Season Total"]
+            st.dataframe(constructor_totals_display, use_container_width=True, hide_index=True, height=320)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB 4 — BACKTEST
+# ═══════════════════════════════════════════════════════════════════════════════
+with tab4:
     if run_bt and bt_seasons:
+        if is_predictive and comparison_model_types:
+            comparison_df, comparison_detail_df, comparison_source_df = cached_model_comparison(
+                tuple(sorted(bt_seasons)),
+                current_season,
+                bt_circuit,
+                tuple(comparison_model_types),
+                comparison_model_configs_json,
+                budget_cap,
+                min_history_weekends,
+                current_season_boost,
+                season_decay,
+            )
+        else:
+            comparison_df, comparison_detail_df, comparison_source_df = (
+                pd.DataFrame(),
+                pd.DataFrame(),
+                pd.DataFrame(),
+            )
+
+        if is_predictive and run_blend_sweep and blend_sweep_weights:
+            blend_sweep_base_params = get_model_default_params(blend_sweep_model_type)
+            for key, value in predictive_model_params.items():
+                if key in blend_sweep_base_params:
+                    blend_sweep_base_params[key] = value
+            blend_sweep_df, blend_sweep_detail_df = cached_blend_weight_sweep(
+                tuple(sorted(bt_seasons)),
+                current_season,
+                bt_circuit,
+                blend_sweep_model_type,
+                tuple(blend_sweep_weights),
+                json.dumps(blend_sweep_base_params, sort_keys=True),
+                budget_cap,
+                min_history_weekends,
+                current_season_boost,
+                season_decay,
+            )
+        else:
+            blend_sweep_df, blend_sweep_detail_df = pd.DataFrame(), pd.DataFrame()
+
         bt_df, bt_source_df = cached_backtest(
             model_mode, tuple(sorted(bt_seasons)), current_season, bt_circuit, use_bonus,
-            budget_cap, w_recent, w_track, w_ppm, w_quali, ridge_alpha, min_history_weekends,
+            budget_cap, w_recent, w_track, w_ppm, w_quali,
+            predictive_model_type, predictive_model_params_json, min_history_weekends,
             current_season_boost, season_decay
         )
         if not bt_df.empty:
+            if is_predictive and not comparison_df.empty:
+                st.subheader("Model Comparison")
+                best_efficiency_row = comparison_df.dropna(subset=["avg_efficiency_pct"]).sort_values(
+                    "avg_efficiency_pct", ascending=False
+                ).iloc[0]
+                best_mae_row = comparison_df.dropna(subset=["avg_driver_mae"]).sort_values(
+                    "avg_driver_mae", ascending=True
+                ).iloc[0]
+                st.info(
+                    "Best lineup efficiency: "
+                    f"{best_efficiency_row['model_label']} ({best_efficiency_row['avg_efficiency_pct']:.1f}%)"
+                    + " | Best driver MAE: "
+                    f"{best_mae_row['model_label']} ({best_mae_row['avg_driver_mae']:.2f})"
+                )
+
+                comp_col1, comp_col2 = st.columns(2)
+                with comp_col1:
+                    fig_comp_eff = go.Figure(go.Bar(
+                        x=comparison_df["model_label"],
+                        y=comparison_df["avg_efficiency_pct"],
+                        marker_color=TEAM_COLORS["Ferrari"],
+                        hovertemplate="%{x}<br>Avg efficiency: %{y:.1f}%<extra></extra>",
+                    ))
+                    apply_transparent_plot_layout(
+                        fig_comp_eff,
+                        yaxis_title="Avg Efficiency %",
+                        height=300,
+                    )
+                    st.plotly_chart(fig_comp_eff, use_container_width=True)
+
+                with comp_col2:
+                    fig_comp_mae = go.Figure(go.Bar(
+                        x=comparison_df["model_label"],
+                        y=comparison_df["avg_driver_mae"],
+                        marker_color=TEAM_COLORS["Mercedes"],
+                        hovertemplate="%{x}<br>Avg driver MAE: %{y:.2f}<extra></extra>",
+                    ))
+                    apply_transparent_plot_layout(
+                        fig_comp_mae,
+                        yaxis_title="Avg Driver MAE",
+                        height=300,
+                    )
+                    st.plotly_chart(fig_comp_mae, use_container_width=True)
+
+                comparison_display = comparison_df[[
+                    "model_label", "races_evaluated", "avg_driver_mae", "avg_actual_pts",
+                    "avg_oracle_pts", "avg_efficiency_pct", "avg_train_rows",
+                    "avg_sample_weight", "model_params",
+                ]].copy()
+                comparison_display.columns = [
+                    "Model", "Races", "Avg Driver MAE", "Avg Actual Pts",
+                    "Avg Oracle Pts", "Avg Efficiency %", "Avg Train Rows",
+                    "Avg Train Weight", "Params",
+                ]
+                comparison_display["Params"] = comparison_display["Params"].map(format_model_params_text)
+                st.dataframe(comparison_display, use_container_width=True, hide_index=True)
+
+                if not comparison_detail_df.empty:
+                    last_season = int(comparison_detail_df["season"].max())
+                    last_season_df = comparison_detail_df[
+                        comparison_detail_df["season"] == last_season
+                    ].copy().sort_values(["round", "race_name", "model_label"])
+                    last_season_df["race_label"] = last_season_df.apply(
+                        lambda row: f"R{int(row['round'])} {row['race_name']}",
+                        axis=1,
+                    )
+
+                    st.subheader(f"Last Season Race-by-Race ({last_season})")
+                    race_col1, race_col2 = st.columns(2)
+
+                    with race_col1:
+                        fig_last_eff = go.Figure()
+                        for model_label in comparison_display["Model"]:
+                            model_rows = last_season_df[last_season_df["model_label"] == model_label]
+                            if model_rows.empty:
+                                continue
+                            fig_last_eff.add_trace(go.Scatter(
+                                x=model_rows["race_label"],
+                                y=model_rows["efficiency_pct"],
+                                mode="lines+markers",
+                                name=model_label,
+                                hovertemplate="%{x}<br>%{fullData.name} efficiency: %{y:.1f}%<extra></extra>",
+                            ))
+                        apply_transparent_plot_layout(
+                            fig_last_eff,
+                            yaxis_title="Efficiency %",
+                            height=360,
+                        )
+                        fig_last_eff.update_layout(xaxis_tickangle=-35, legend=dict(orientation="h", y=1.15))
+                        st.plotly_chart(fig_last_eff, use_container_width=True)
+
+                    with race_col2:
+                        fig_last_mae = go.Figure()
+                        for model_label in comparison_display["Model"]:
+                            model_rows = last_season_df[last_season_df["model_label"] == model_label]
+                            if model_rows.empty:
+                                continue
+                            fig_last_mae.add_trace(go.Scatter(
+                                x=model_rows["race_label"],
+                                y=model_rows["driver_mae"],
+                                mode="lines+markers",
+                                name=model_label,
+                                hovertemplate="%{x}<br>%{fullData.name} driver MAE: %{y:.2f}<extra></extra>",
+                            ))
+                        apply_transparent_plot_layout(
+                            fig_last_mae,
+                            yaxis_title="Driver MAE",
+                            height=360,
+                        )
+                        fig_last_mae.update_layout(xaxis_tickangle=-35, legend=dict(orientation="h", y=1.15))
+                        st.plotly_chart(fig_last_mae, use_container_width=True)
+
+                    season_winner_df = last_season_df.loc[
+                        last_season_df.groupby("race_label")["efficiency_pct"].idxmax()
+                    ][["race_label", "model_label", "efficiency_pct"]].copy()
+                    season_winner_df.columns = ["Race", "Best Model", "Best Efficiency %"]
+                    st.dataframe(season_winner_df, use_container_width=True, hide_index=True)
+
+                    if "baseline" in comparison_detail_df["model_type"].unique():
+                        baseline_last_season_df = last_season_df[
+                            last_season_df["model_type"] == "baseline"
+                        ][["race_label", "efficiency_pct", "driver_mae"]].rename(
+                            columns={
+                                "efficiency_pct": "baseline_efficiency_pct",
+                                "driver_mae": "baseline_driver_mae",
+                            }
+                        )
+                        vs_baseline_df = last_season_df.merge(
+                            baseline_last_season_df,
+                            on="race_label",
+                            how="left",
+                        )
+                        vs_baseline_df = vs_baseline_df[
+                            vs_baseline_df["model_type"] != "baseline"
+                        ].copy()
+                        vs_baseline_df["efficiency_delta_pct"] = (
+                            vs_baseline_df["efficiency_pct"] - vs_baseline_df["baseline_efficiency_pct"]
+                        )
+                        vs_baseline_df["driver_mae_delta"] = (
+                            vs_baseline_df["driver_mae"] - vs_baseline_df["baseline_driver_mae"]
+                        )
+
+                        if not vs_baseline_df.empty:
+                            st.subheader("Against Baseline")
+                            delta_col1, delta_col2 = st.columns(2)
+
+                            with delta_col1:
+                                fig_vs_base_eff = go.Figure()
+                                for model_label in sorted(vs_baseline_df["model_label"].unique()):
+                                    model_rows = vs_baseline_df[vs_baseline_df["model_label"] == model_label]
+                                    fig_vs_base_eff.add_trace(go.Scatter(
+                                        x=model_rows["race_label"],
+                                        y=model_rows["efficiency_delta_pct"],
+                                        mode="lines+markers",
+                                        name=model_label,
+                                        hovertemplate="%{x}<br>%{fullData.name} vs baseline: %{y:.1f} pts<extra></extra>",
+                                    ))
+                                fig_vs_base_eff.add_hline(y=0.0, line_dash="dash", line_color="gray")
+                                apply_transparent_plot_layout(
+                                    fig_vs_base_eff,
+                                    yaxis_title="Efficiency Delta vs Baseline",
+                                    height=340,
+                                )
+                                fig_vs_base_eff.update_layout(xaxis_tickangle=-35, legend=dict(orientation="h", y=1.15))
+                                st.plotly_chart(fig_vs_base_eff, use_container_width=True)
+
+                            with delta_col2:
+                                fig_vs_base_mae = go.Figure()
+                                for model_label in sorted(vs_baseline_df["model_label"].unique()):
+                                    model_rows = vs_baseline_df[vs_baseline_df["model_label"] == model_label]
+                                    fig_vs_base_mae.add_trace(go.Scatter(
+                                        x=model_rows["race_label"],
+                                        y=model_rows["driver_mae_delta"],
+                                        mode="lines+markers",
+                                        name=model_label,
+                                        hovertemplate="%{x}<br>%{fullData.name} MAE delta: %{y:.2f}<extra></extra>",
+                                    ))
+                                fig_vs_base_mae.add_hline(y=0.0, line_dash="dash", line_color="gray")
+                                apply_transparent_plot_layout(
+                                    fig_vs_base_mae,
+                                    yaxis_title="Driver MAE Delta vs Baseline",
+                                    height=340,
+                                )
+                                fig_vs_base_mae.update_layout(xaxis_tickangle=-35, legend=dict(orientation="h", y=1.15))
+                                st.plotly_chart(fig_vs_base_mae, use_container_width=True)
+
+                            baseline_summary_df = (
+                                vs_baseline_df.groupby("model_label")
+                                .agg(
+                                    avg_efficiency_delta_pct=("efficiency_delta_pct", "mean"),
+                                    avg_driver_mae_delta=("driver_mae_delta", "mean"),
+                                    races_beating_baseline_eff=("efficiency_delta_pct", lambda s: int((s > 0).sum())),
+                                    races_beating_baseline_mae=("driver_mae_delta", lambda s: int((s < 0).sum())),
+                                )
+                                .reset_index()
+                                .sort_values("avg_efficiency_delta_pct", ascending=False)
+                            )
+                            baseline_summary_df.columns = [
+                                "Model",
+                                "Avg Efficiency Delta",
+                                "Avg MAE Delta",
+                                "Eff Wins vs Baseline",
+                                "MAE Wins vs Baseline",
+                            ]
+                            st.dataframe(baseline_summary_df, use_container_width=True, hide_index=True)
+
+                if not comparison_source_df.empty:
+                    st.caption("Comparison source seasons: " + " | ".join(
+                        f"{int(r['season'])}:{r['source']} ({int(r['weekends_loaded'])} races)"
+                        for _, r in comparison_source_df.iterrows()
+                    ))
+
+                if not blend_sweep_df.empty:
+                    st.subheader("Blend Weight Sweep")
+                    best_efficiency_weight = blend_sweep_df.sort_values(
+                        ["avg_efficiency_pct", "avg_driver_mae"],
+                        ascending=[False, True],
+                    ).iloc[0]
+                    best_mae_weight = blend_sweep_df.sort_values(
+                        ["avg_driver_mae", "avg_efficiency_pct"],
+                        ascending=[True, False],
+                    ).iloc[0]
+                    st.info(
+                        f"{MODEL_LABELS[blend_sweep_model_type]} best avg efficiency at "
+                        f"`{best_efficiency_weight['blend_weight']:.2f}`"
+                        f" ({best_efficiency_weight['avg_efficiency_pct']:.2f}%)"
+                        + " | best avg MAE at "
+                        f"`{best_mae_weight['blend_weight']:.2f}`"
+                        f" ({best_mae_weight['avg_driver_mae']:.3f})"
+                    )
+
+                    sweep_col1, sweep_col2 = st.columns(2)
+                    with sweep_col1:
+                        fig_sweep_eff = go.Figure(go.Scatter(
+                            x=blend_sweep_df["blend_weight"],
+                            y=blend_sweep_df["avg_efficiency_pct"],
+                            mode="lines+markers",
+                            name="Avg Efficiency %",
+                            hovertemplate="weight=%{x:.2f}<br>avg efficiency=%{y:.2f}%<extra></extra>",
+                        ))
+                        apply_transparent_plot_layout(
+                            fig_sweep_eff,
+                            xaxis_title="Blend Weight",
+                            yaxis_title="Avg Efficiency %",
+                            height=320,
+                        )
+                        st.plotly_chart(fig_sweep_eff, use_container_width=True)
+
+                    with sweep_col2:
+                        fig_sweep_mae = go.Figure(go.Scatter(
+                            x=blend_sweep_df["blend_weight"],
+                            y=blend_sweep_df["avg_driver_mae"],
+                            mode="lines+markers",
+                            name="Avg Driver MAE",
+                            hovertemplate="weight=%{x:.2f}<br>avg driver MAE=%{y:.3f}<extra></extra>",
+                        ))
+                        apply_transparent_plot_layout(
+                            fig_sweep_mae,
+                            xaxis_title="Blend Weight",
+                            yaxis_title="Avg Driver MAE",
+                            height=320,
+                        )
+                        st.plotly_chart(fig_sweep_mae, use_container_width=True)
+
+                    sweep_display = blend_sweep_df.copy()
+                    sweep_display.columns = [
+                        "Blend Weight",
+                        "Races",
+                        "Avg Efficiency %",
+                        "Median Efficiency %",
+                        "Avg Driver MAE",
+                        "Median Driver MAE",
+                    ]
+                    st.dataframe(sweep_display, use_container_width=True, hide_index=True)
+
+                    if not blend_sweep_detail_df.empty:
+                        last_sweep_season = int(blend_sweep_detail_df["season"].max())
+                        last_sweep_df = blend_sweep_detail_df[
+                            blend_sweep_detail_df["season"] == last_sweep_season
+                        ].copy().sort_values(["round", "blend_weight"])
+                        last_sweep_df["race_label"] = last_sweep_df.apply(
+                            lambda row: f"R{int(row['round'])} {row['race_name']}",
+                            axis=1,
+                        )
+                        fig_sweep_race = go.Figure()
+                        for blend_weight in sorted(last_sweep_df["blend_weight"].unique()):
+                            weight_rows = last_sweep_df[last_sweep_df["blend_weight"] == blend_weight]
+                            fig_sweep_race.add_trace(go.Scatter(
+                                x=weight_rows["race_label"],
+                                y=weight_rows["efficiency_pct"],
+                                mode="lines+markers",
+                                name=f"w={blend_weight:.2f}",
+                                hovertemplate="%{x}<br>%{fullData.name} efficiency=%{y:.1f}%<extra></extra>",
+                            ))
+                        apply_transparent_plot_layout(
+                            fig_sweep_race,
+                            yaxis_title=f"{last_sweep_season} Efficiency %",
+                            height=360,
+                        )
+                        fig_sweep_race.update_layout(xaxis_tickangle=-35, legend=dict(orientation="h", y=1.15))
+                        st.plotly_chart(fig_sweep_race, use_container_width=True)
+
+                st.markdown("---")
+
             # KPIs
             bk1, bk2, bk3, bk4 = st.columns(4)
             bk1.metric("Races Evaluated", len(bt_df))
@@ -642,6 +1654,10 @@ with tab3:
                 bk5, bk6 = st.columns(2)
                 bk5.metric("Avg Driver MAE", f"{bt_df['driver_mae'].mean():.2f}")
                 bk6.metric("Avg Train Weight", f"{bt_df['avg_sample_weight'].mean():.2f}")
+                st.caption(
+                    f"Selected predictive model: {selected_model_label} "
+                    f"({format_model_params_text(json.dumps(selected_model_params, sort_keys=True))})"
+                )
 
             col_bt1, col_bt2 = st.columns(2)
 
@@ -775,9 +1791,9 @@ with tab3:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TAB 4 — SIGNAL EXPLORER
+# TAB 5 — SIGNAL EXPLORER
 # ═══════════════════════════════════════════════════════════════════════════════
-with tab4:
+with tab5:
     selected_driver = st.selectbox("Select driver to inspect", options=d_scores["driver"].tolist())
     row = d_scores[d_scores["driver"] == selected_driver].iloc[0]
 
@@ -790,8 +1806,14 @@ with tab4:
         col_r4.metric("Track History", f"{row['track_history']:.1f}")
         col_r5.metric("Expert Adj", f"{row['testing_bonus']:+.1f}")
 
-        explore_cols = ["recent_form_3", "recent_form_5", "track_history", "season_avg", "quali_form_5"]
-        explore_labels = ["Recent 3", "Recent 5", "Track", "Season Avg", "Quali"]
+        explore_cols = [
+            "recent_form_5",
+            "era_recent_form",
+            "era_track_history",
+            "season_recent_form",
+            "season_quali_form",
+        ]
+        explore_labels = ["Recent 5", "Era Form", "Era Track", "2026 Form", "2026 Quali"]
         explore_df = d_scores[["driver"] + explore_cols].copy()
         scaled_df = explore_df.set_index("driver")
         scaled_df = (scaled_df - scaled_df.mean()) / scaled_df.std(ddof=0).replace(0, 1)
@@ -842,17 +1864,29 @@ with tab4:
             st.plotly_chart(fig_heat, use_container_width=True)
 
         st.subheader("Learned Feature Importance")
-        coef_df = trained_model["coefficients_df"][["label", "coefficient"]].copy()
-        fig_coef = go.Figure(go.Bar(
-            x=coef_df["coefficient"],
-            y=coef_df["label"],
-            orientation="h",
-            marker_color=["#2ca02c" if x >= 0 else "#d62728" for x in coef_df["coefficient"]],
-            hovertemplate="%{y}: %{x:.3f}<extra></extra>",
-        ))
+        if trained_model["importance_display"] == "coefficients":
+            coef_df = trained_model["coefficients_df"][["label", "coefficient"]].copy()
+            fig_coef = go.Figure(go.Bar(
+                x=coef_df["coefficient"],
+                y=coef_df["label"],
+                orientation="h",
+                marker_color=["#2ca02c" if x >= 0 else "#d62728" for x in coef_df["coefficient"]],
+                hovertemplate="%{y}: %{x:.3f}<extra></extra>",
+            ))
+            importance_xaxis_title = "Standardized coefficient"
+        else:
+            coef_df = trained_model["feature_importances_df"][["label", "importance"]].copy()
+            fig_coef = go.Figure(go.Bar(
+                x=coef_df["importance"],
+                y=coef_df["label"],
+                orientation="h",
+                marker_color=TEAM_COLORS["McLaren"],
+                hovertemplate="%{y}: %{x:.3f}<extra></extra>",
+            ))
+            importance_xaxis_title = "Feature importance"
         apply_transparent_plot_layout(
             fig_coef,
-            xaxis_title="Standardized coefficient",
+            xaxis_title=importance_xaxis_title,
             height=360,
             margin=dict(t=10, b=20, l=10, r=10),
         )
@@ -932,7 +1966,8 @@ with tab4:
                 HEURISTIC_MODE, tuple(sorted(train_seasons)), current_season, target_circuit,
                 combo["w_r"], combo["w_t"], combo["w_p"], combo["w_q"],
                 use_bonus, include_current_season, tuple(), tuple(), budget_cap,
-                ridge_alpha, min_history_weekends
+                predictive_model_type, predictive_model_params_json,
+                min_history_weekends, current_season_boost, season_decay
             )
             res = combo_output["result"]
             sens_rows.append({
@@ -946,9 +1981,9 @@ with tab4:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TAB 5 — DATA TABLES
+# TAB 6 — DATA TABLES
 # ═══════════════════════════════════════════════════════════════════════════════
-with tab5:
+with tab6:
     st.subheader("Training Data Snapshot")
     dt1, dt2, dt3, dt4 = st.columns(4)
     dt1.metric("Seasons Loaded", int(source_df["season"].nunique()) if not source_df.empty else 0)
@@ -972,8 +2007,10 @@ with tab5:
         st.markdown("**Current Prediction Feature Table**")
         feature_cols = [
             "rank", "driver", "team", "cost_m", "predicted_points", "base_predicted_points",
-            "recent_form_3", "recent_form_5", "track_history", "season_avg",
-            "quali_form_5", "dnf_rate_5", "team_recent_form_3", "track_experience",
+            "recent_form_3", "recent_form_5", "era_recent_form",
+            "track_history", "era_track_history", "season_avg", "season_recent_form",
+            "season_quali_form", "quali_form_5", "dnf_rate_5", "team_recent_form_3",
+            "team_season_avg", "current_season_starts", "track_experience",
             "overall_experience", "testing_bonus",
         ]
     else:
@@ -987,20 +2024,21 @@ with tab5:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TAB 6 — HOW IT WORKS
+# TAB 7 — HOW IT WORKS
 # ═══════════════════════════════════════════════════════════════════════════════
-with tab6:
+with tab7:
     st.subheader("Model Summary")
     if is_predictive:
         st.markdown(f"""
-        This app is using a transparent **next-race fantasy points prediction model**.
+        This app is using a **{selected_model_label}** next-race fantasy points prediction model.
 
         It works in five steps:
         1. Load historical race weekends for the selected training seasons.
         2. Convert every historical weekend into fantasy points using the scoring engine.
         3. Build one training row per driver per race using only information available **before** that race.
-        4. Fit a ridge-style linear regression to predict next-race fantasy points.
+        4. Fit the selected predictive model family on the engineered driver-race feature set.
         5. Predict the current grid, optionally apply expert adjustments, and optimise the best 5-driver / 2-constructor team under the budget cap.
+        6. If transfer modelling is enabled, apply the free-transfer allowance and subtract 10 points per extra move from the optimizer objective.
         """)
     else:
         st.markdown(f"""
@@ -1011,21 +2049,40 @@ with tab6:
         2. Convert each weekend into fantasy points using the scoring engine.
         3. Build four driver signals: recent form, track history, season points-per-million, and qualifying form.
         4. Z-score those signals across the grid, apply the chosen weights, add optional testing bonuses, and optimise the best 5-driver / 2-constructor team under the budget cap.
+        5. If transfer modelling is enabled, apply the free-transfer allowance and subtract 10 points per extra move from the optimizer objective.
         """)
 
     st.markdown("**Where the data comes from**")
     st.markdown("""
     - Historical race and qualifying data is pulled from the Jolpica Ergast-compatible API when available.
+    - Sprint results and fastest-lap flags are also pulled when the upstream endpoint provides them.
     - Downloaded seasons are cached locally and reused on future runs.
     - If the API is unavailable, the app falls back to embedded seed data included in this project.
     - The season source summary in the `Data Tables` tab shows exactly which seasons came from `api`, `cache`, or `seed`.
     - Current driver prices, constructor prices, and manual FP/testing bonuses come from the project files and constants in this repo.
     """)
 
+    st.markdown("**2026 scoring coverage**")
+    st.markdown("""
+    - The scoring engine now applies 2026 qualifying, sprint, race, and constructor rules for any fields present in the weekend data.
+    - This includes Q2/Q3 constructor bonuses, qualifying no-time penalties, sprint scoring, race fastest lap, and constructor disqualification penalties.
+    - Overtakes, Driver of the Day, and pit-stop bonuses are supported as optional fields in the data model, but they are usually unavailable from the cached Jolpica weekend data in this repo.
+    - When those optional fields are missing, the model currently treats them as zero rather than inventing estimates.
+    """)
+
     if is_predictive:
         st.markdown("**Model fit diagnostics**")
         metrics_df = pd.DataFrame([trained_model["train_metrics"]])
         st.dataframe(metrics_df, use_container_width=True, hide_index=True)
+
+        st.markdown("**Active model settings**")
+        st.dataframe(
+            pd.DataFrame(
+                [{"model": selected_model_label, "params": format_model_params_text(json.dumps(selected_model_params, sort_keys=True))}]
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
 
         st.markdown("**Season weighting rules**")
         st.markdown(
@@ -1035,26 +2092,51 @@ with tab6:
         )
 
         st.markdown("**Model formula**")
-        st.code("predicted_points = intercept + Σ(standardized_feature_i * coefficient_i) + expert_adjustment")
+        if trained_model["importance_display"] == "coefficients":
+            st.code("predicted_points = intercept + Σ(standardized_feature_i * coefficient_i) + expert_adjustment")
 
-        st.markdown("**Learned coefficients**")
-        st.dataframe(trained_model["coefficients_df"][["label", "coefficient", "abs_coefficient"]],
-                     use_container_width=True, hide_index=True)
+            st.markdown("**Learned coefficients**")
+            st.dataframe(trained_model["coefficients_df"][["label", "coefficient", "abs_coefficient"]],
+                         use_container_width=True, hide_index=True)
 
-        st.markdown("**Driver-level contribution breakdown**")
-        explain_driver = st.selectbox("Inspect prediction decomposition", options=d_scores["driver"].tolist(),
-                                      key="explain_driver")
-        contribution_cols = [f"{col}_contrib" for col in feature_columns]
-        explain_cols = ["driver", "team", "predicted_points", "base_predicted_points",
-                        "testing_bonus"] + feature_columns + contribution_cols
-        explain_row = d_scores[d_scores["driver"] == explain_driver][explain_cols]
-        st.dataframe(explain_row, use_container_width=True, hide_index=True)
+            st.markdown("**Driver-level contribution breakdown**")
+            explain_driver = st.selectbox("Inspect prediction decomposition", options=d_scores["driver"].tolist(),
+                                          key="explain_driver")
+            contribution_cols = [f"{col}_contrib" for col in feature_columns]
+            explain_cols = ["driver", "team", "predicted_points", "base_predicted_points",
+                            "testing_bonus"] + feature_columns + contribution_cols
+            explain_row = d_scores[d_scores["driver"] == explain_driver][explain_cols]
+            st.dataframe(explain_row, use_container_width=True, hide_index=True)
+        else:
+            st.code("predicted_points = model(feature_vector) + expert_adjustment")
+
+            if trained_model.get("component_summary_df") is not None:
+                st.markdown("**Blend components**")
+                st.dataframe(
+                    trained_model["component_summary_df"],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+            st.markdown("**Learned feature importance**")
+            st.dataframe(trained_model["feature_importances_df"][["label", "importance", "abs_importance"]],
+                         use_container_width=True, hide_index=True)
+
+            st.markdown("**Driver-level feature snapshot**")
+            explain_driver = st.selectbox("Inspect prediction inputs", options=d_scores["driver"].tolist(),
+                                          key="explain_driver")
+            explain_cols = ["driver", "team", "predicted_points", "base_predicted_points",
+                            "testing_bonus"] + feature_columns
+            explain_row = d_scores[d_scores["driver"] == explain_driver][explain_cols]
+            st.dataframe(explain_row, use_container_width=True, hide_index=True)
+            st.caption("Per-feature prediction contributions are only available for the linear model families.")
 
         st.markdown("**Notes**")
         st.markdown(
             "- The model is trained on historical driver-level examples rather than manually chosen weights.\n"
             "- Rule changes are handled by season-aware sample weighting, so newer seasons matter more than older ones.\n"
             "- Backtests use an expanding-window approach so each race is predicted only from earlier races.\n"
+            "- Tree and baseline models show global feature importance instead of signed linear coefficients.\n"
             "- The backtest oracle is budget-constrained, making the benchmark fairer than the earlier heuristic version."
         )
     else:

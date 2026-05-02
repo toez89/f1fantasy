@@ -5,19 +5,21 @@ Runs the value model + optimizer on every race in historical seasons
 and measures how the model's picks would have actually performed.
 
 Usage:
-    python backtest.py --seasons 2023 2024 --circuit australia
+    python backtest.py --seasons 2023 2024 --circuit miami
 """
 
 import argparse
 import pandas as pd
 import numpy as np
 import json
+import time
 from pathlib import Path
 
 # Local imports
 import sys
 sys.path.insert(0, str(Path(__file__).parent))
 from fetch_data   import build_weekend_records
+from pricing      import load_cost_snapshot
 from seed_data    import get_seeded_weekends
 from scoring      import compute_race_weekend, constructor_fantasy_points
 from value_model  import build_history_df, score_all
@@ -26,73 +28,59 @@ from optimizer    import optimise_team, print_team
 
 CACHE_DIR = Path(__file__).parent / ".cache"
 CACHE_DIR.mkdir(exist_ok=True)
+CURRENT_SEASON_CACHE_TTL_SECONDS = 60 * 60 * 12
 
-CURRENT_DRIVER_COSTS = {
-    "Max Verstappen"    : 27.7,
-    "George Russell"    : 27.4,
-    "Lando Norris"      : 27.2,
-    "Oscar Piastri"     : 25.5,
-    "Kimi Antonelli"    : 23.2,
-    "Charles Leclerc"   : 22.8,
-    "Lewis Hamilton"    : 22.5,
-    "Isack Hadjar"      : 15.1,
-    "Pierre Gasly"      : 12.0,
-    "Carlos Sainz"      : 11.8,
-    "Alexander Albon"   : 11.6,
-    "Fernando Alonso"   : 10.0,
-    "Lance Stroll"      :  8.0,
-    "Oliver Bearman"    :  7.4,
-    "Esteban Ocon"      :  7.3,
-    "Nico Hulkenberg"   :  6.8,
-    "Liam Lawson"       :  6.5,
-    "Gabriel Bortoleto" :  6.4,
-    "Arvid Lindblad"    :  6.2,
-    "Franco Colapinto"  :  6.2,
-    "Sergio Perez"      :  6.0,
-    "Valtteri Bottas"   :  5.9,
-}
+CURRENT_DRIVER_COSTS, CURRENT_CONSTRUCTOR_COSTS, CURRENT_BUDGET_CAP, CURRENT_COST_SNAPSHOT = load_cost_snapshot()
 
-CURRENT_CONSTRUCTOR_COSTS = {
-    "Mercedes"     : 29.3,
-    "McLaren"      : 28.9,
-    "Red Bull Racing": 28.2,
-    "Ferrari"      : 23.3,
-    "Alpine"       : 12.5,
-    "Williams"     : 12.0,
-    "Aston Martin" : 10.3,
-    "Haas F1 Team" : 7.4,
-    "Audi"         : 6.6,
-    "Racing Bulls" : 6.3,
-    "Cadillac"     : 6.0,
-}
-
-# 2026 FP1/FP2 testing bonuses (manual adjustment based on practice sessions)
-TESTING_BONUSES = {
-    "Oscar Piastri"     :  1.5,   # FP2 P1 at home race
-    "Kimi Antonelli"    :  1.2,   # FP2 P2, only 0.005s behind Russell in FP1
-    "Charles Leclerc"   :  1.0,   # FP1 P1
-    "George Russell"    :  0.8,   # Pre-season favourite, FP1 P3
-    "Arvid Lindblad"    :  0.7,   # FP2 P8 as rookie, impressive pace
-    "Nico Hulkenberg"   :  0.5,   # P4 FP2, 9 straight top-11 at Albert Park
-    "Max Verstappen"    :  0.3,   # FP1 P3, consistent
-    "Lando Norris"      :  0.3,   # FP2 P7
-    "Oliver Bearman"    :  0.2,   # Haas solid pre-season testing
-    "Lewis Hamilton"    :  0.2,   # FP1 P2
-}
+# Manual adjustments are intentionally empty until fresh Miami practice/news is added.
+TESTING_BONUSES = {}
 
 
 # ---------------------------------------------------------------------------
 # Core backtest pipeline
 # ---------------------------------------------------------------------------
 
+def _load_cached_weekends(cache_path: Path, max_age_seconds: int | None = None) -> list[dict] | None:
+    """Return cached weekends when the cache contains usable race data."""
+    if not cache_path.exists():
+        return None
+    if max_age_seconds is not None:
+        cache_age = time.time() - cache_path.stat().st_mtime
+        if cache_age > max_age_seconds:
+            return None
+    wkds = json.loads(cache_path.read_text())
+    if not wkds:
+        return None
+
+    first_driver = (((wkds or [{}])[0]).get("drivers") or [{}])[0]
+    required_fields = {
+        "quali_reached_q2",
+        "quali_reached_q3",
+        "quali_no_time",
+        "quali_dsq",
+        "sprint_pos",
+        "race_fastest_lap",
+        "race_dsq",
+    }
+    return wkds if required_fields.issubset(first_driver.keys()) else None
+
+
 def compute_all_weekends(weekend_records: list[dict]) -> list[dict]:
     """Add computed fantasy scores to each weekend record."""
     for w in weekend_records:
-        scores = compute_race_weekend(w["drivers"])
-        w["scores"] = scores
-        # Constructor scores
-        team_map = {d["driver_name"]: d["team"] for d in w["drivers"]}
-        w["constructor_scores"] = constructor_fantasy_points(scores, team_map)
+        scores = w.get("scores")
+        if not scores:
+            scores = compute_race_weekend(w["drivers"], weekend_meta=w)
+            w["scores"] = scores
+
+        if not w.get("constructor_scores"):
+            team_map = {d["driver_name"]: d["team"] for d in w["drivers"]}
+            w["constructor_scores"] = constructor_fantasy_points(
+                scores,
+                team_map,
+                driver_results=w["drivers"],
+                weekend_meta=w,
+            )
     return weekend_records
 
 
@@ -117,17 +105,29 @@ def run_backtest(
     all_weekends = []
     for s in seasons:
         cache = CACHE_DIR / f"weekends_{s}.json"
-        if cache.exists():
-            wkds = json.loads(cache.read_text())
+        cache_ttl = CURRENT_SEASON_CACHE_TTL_SECONDS if s == 2026 else None
+        cached_weekends = _load_cached_weekends(cache, max_age_seconds=cache_ttl)
+        if cached_weekends is not None:
+            wkds = cached_weekends
             print(f"  [cache] Season {s}: {len(wkds)} races")
         else:
             try:
                 print(f"  Fetching season {s} from API...")
-                wkds = build_weekend_records(s)
-                cache.write_text(json.dumps(wkds))
-                print(f"  Got {len(wkds)} races")
+                wkds = build_weekend_records(s, use_cache=cache_ttl is None)
+                if wkds:
+                    cache.write_text(json.dumps(wkds))
+                    print(f"  Got {len(wkds)} races")
+                else:
+                    print(f"  API returned no completed races for {s}, checking seed data")
             except Exception as e:
                 print(f"  API unavailable, using seeded data for {s}")
+                wkds = []
+            if not wkds:
+                stale_weekends = _load_cached_weekends(cache)
+                if stale_weekends is not None:
+                    wkds = stale_weekends
+                    print(f"  [stale cache] Season {s}: {len(wkds)} races")
+            if not wkds:
                 wkds = [w for w in get_seeded_weekends() if w["season"] == s]
                 print(f"  Loaded {len(wkds)} seeded races for {s}")
         wkds = compute_all_weekends(wkds)
@@ -272,7 +272,7 @@ if __name__ == "__main__":
     parser.add_argument("--seasons",  nargs="+", type=int,
                         default=[2023, 2024],
                         help="Seasons to backtest over (e.g. 2023 2024)")
-    parser.add_argument("--circuit",  type=str, default="australia",
+    parser.add_argument("--circuit",  type=str, default="miami",
                         help="Circuit to test (or 'all' for every race)")
     parser.add_argument("--budget",   type=float, default=100.0,
                         help="Budget cap in millions (default 100)")

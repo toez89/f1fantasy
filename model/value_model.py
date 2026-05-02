@@ -35,6 +35,8 @@ CIRCUIT_ALIAS = {
     # Map common short names → ergast circuit names
     "australia" : ["Albert Park Grand Prix Circuit"],
     "bahrain"   : ["Bahrain International Circuit"],
+    "china"     : ["Shanghai International Circuit"],
+    "chinese"   : ["Shanghai International Circuit"],
     "saudi"     : ["Jeddah Street Circuit"],
     "imola"     : ["Autodromo Enzo e Dino Ferrari"],
     "monaco"    : ["Circuit de Monaco"],
@@ -47,7 +49,8 @@ CIRCUIT_ALIAS = {
     "netherlands": ["Circuit Zandvoort"],
     "italy"     : ["Autodromo Nazionale di Monza"],
     "singapore" : ["Marina Bay Street Circuit"],
-    "japan"     : ["Suzuka International Racing Course"],
+    "japan"     : ["Suzuka International Racing Course", "Suzuka Circuit"],
+    "miami"     : ["Miami International Autodrome"],
     "qatar"     : ["Losail International Circuit"],
     "usa"       : ["Circuit of the Americas"],
     "mexico"    : ["Autodromo Hermanos Rodriguez"],
