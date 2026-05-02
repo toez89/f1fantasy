@@ -8,7 +8,7 @@ Constraints:
   - Exactly 5 drivers
   - Exactly 2 constructors
   - Total cost ≤ budget (default $100M)
-  - Objective: maximise sum of predicted fantasy scores
+  - Objective: maximise sum of predicted fantasy scores, including one free 2x driver boost
 """
 
 import pandas as pd
@@ -55,7 +55,7 @@ def optimise_team(
 
     Returns
     -------
-    dict with keys: drivers, constructors, total_cost, total_score
+    dict with keys: drivers, constructors, boost_driver, total_cost, total_score
     """
     locked_d = set(locked_drivers or [])
     locked_c = set(locked_constructors or [])
@@ -89,6 +89,8 @@ def _optimise_pulp(d_df, c_df, budget_m, n_drivers, n_constructors,
               for i, row in d_df.iterrows()}
     c_vars = {row.constructor: pulp.LpVariable(f"c_{i}", cat="Binary")
               for i, row in c_df.iterrows()}
+    boost_vars = {row.driver: pulp.LpVariable(f"boost_{i}", cat="Binary")
+                  for i, row in d_df.iterrows()}
 
     kept_driver_expr = pulp.lpSum(
         d_vars[name] for name in current_d if name in d_vars
@@ -105,7 +107,8 @@ def _optimise_pulp(d_df, c_df, budget_m, n_drivers, n_constructors,
     prob += (
         pulp.lpSum(d_vars[r.driver]       * r.norm_score for _, r in d_df.iterrows()) +
         pulp.lpSum(c_vars[r.constructor]  * r.norm_score for _, r in c_df.iterrows()) -
-        (transfer_penalty * excess_transfers)
+        (transfer_penalty * excess_transfers) +
+        pulp.lpSum(boost_vars[r.driver]    * r.norm_score for _, r in d_df.iterrows())
     )
 
     # Budget
@@ -117,6 +120,7 @@ def _optimise_pulp(d_df, c_df, budget_m, n_drivers, n_constructors,
     # Count constraints
     prob += pulp.lpSum(d_vars.values()) == n_drivers
     prob += pulp.lpSum(c_vars.values()) == n_constructors
+    prob += pulp.lpSum(boost_vars.values()) == 1
 
     # Locked selections
     for name in locked_d:
@@ -126,16 +130,21 @@ def _optimise_pulp(d_df, c_df, budget_m, n_drivers, n_constructors,
         if name in c_vars:
             prob += c_vars[name] == 1
 
+    for name in boost_vars:
+        prob += boost_vars[name] <= d_vars[name]
+
     prob += excess_transfers >= transfer_count_expr - free_transfers
 
     prob.solve(pulp.PULP_CBC_CMD(msg=0))
 
     selected_d = [n for n, v in d_vars.items() if pulp.value(v) == 1]
     selected_c = [n for n, v in c_vars.items() if pulp.value(v) == 1]
+    selected_boost = next((n for n, v in boost_vars.items() if pulp.value(v) == 1), None)
 
     return _format_result(
         d_df, c_df, selected_d, selected_c,
         current_d, current_c, free_transfers, transfer_penalty, budget_m,
+        boost_driver=selected_boost,
     )
 
 
@@ -178,8 +187,10 @@ def _optimise_brute(d_df, c_df, budget_m, n_drivers, n_constructors,
             selected_c = list(cc) + list(locked_c)
             transfer_count = _count_transfers(selected_d, selected_c, current_d, current_c)
             paid_transfers = max(0, transfer_count - free_transfers)
+            boost_score = max(d_score_map[n] for n in selected_d) if selected_d else 0.0
             total = (
                 dc_score + locked_d_score + sum(c_score_map[n] for n in cc) + locked_c_score
+                + boost_score
                 - (paid_transfers * transfer_penalty)
             )
             if total > best_score:
@@ -208,22 +219,27 @@ def _count_transfers(selected_d, selected_c, current_d, current_c) -> int:
 def _format_result(
     d_df, c_df, selected_d, selected_c,
     current_d, current_c, free_transfers, transfer_penalty, budget_m,
+    boost_driver=None,
 ) -> dict:
     d_rows = d_df[d_df["driver"].isin(selected_d)].copy()
     c_rows = c_df[c_df["constructor"].isin(selected_c)].copy()
 
     total_cost  = float(d_rows["cost_m"].sum() + c_rows["cost_m"].sum())
-    base_score = float(d_rows["norm_score"].sum() + c_rows["norm_score"].sum())
+    unboosted_score = float(d_rows["norm_score"].sum() + c_rows["norm_score"].sum())
     transfer_count = _count_transfers(selected_d, selected_c, current_d, current_c)
     paid_transfers = max(0, int(transfer_count) - int(free_transfers))
     transfer_cost = float(paid_transfers * transfer_penalty)
-    total_score = float(base_score - transfer_cost)
-    boost_driver = None
     boost_score = None
     if not d_rows.empty:
-        boost_row = d_rows.sort_values("norm_score", ascending=False).iloc[0]
-        boost_driver = boost_row["driver"]
+        if boost_driver is not None and boost_driver in set(d_rows["driver"]):
+            boost_row = d_rows[d_rows["driver"] == boost_driver].iloc[0]
+        else:
+            boost_row = d_rows.sort_values("norm_score", ascending=False).iloc[0]
+            boost_driver = boost_row["driver"]
         boost_score = float(boost_row["norm_score"])
+    boost_bonus = float(boost_score or 0.0)
+    boosted_score = float(unboosted_score + boost_bonus)
+    total_score = float(boosted_score - transfer_cost)
 
     current_d_set = set(current_d)
     current_c_set = set(current_c)
@@ -242,13 +258,15 @@ def _format_result(
         "constructors" : c_rows.sort_values("norm_score", ascending=False),
         "total_cost"   : round(total_cost, 1),
         "total_score"  : round(total_score, 4),
-        "base_score"   : round(base_score, 4),
+        "base_score"   : round(boosted_score, 4),
+        "unboosted_score": round(unboosted_score, 4),
         "transfer_count": int(transfer_count),
         "free_transfers": int(free_transfers),
         "paid_transfers": int(paid_transfers),
         "transfer_cost": round(transfer_cost, 4),
         "boost_driver": boost_driver,
         "boost_score": round(boost_score, 4) if boost_score is not None else None,
+        "boost_bonus": round(boost_bonus, 4),
         "kept_drivers": kept_drivers,
         "incoming_drivers": incoming_drivers,
         "outgoing_drivers": outgoing_drivers,
@@ -275,7 +293,7 @@ def print_team(result: dict):
     if result.get("boost_driver"):
         print(
             f"\n  2x Boost    : {result['boost_driver']} "
-            f"(score={result['boost_score']:.3f})"
+            f"(adds {result['boost_bonus']:.3f})"
         )
     print(f"\n  Budget used : {result['budget_used']}")
     print(f"  Total score : {result['total_score']:.4f}")

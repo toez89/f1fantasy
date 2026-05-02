@@ -886,9 +886,11 @@ def run_predictive_backtest(
 
         picked_drivers = list(selected_team["drivers"]["driver"])
         picked_constructors = list(selected_team["constructors"]["constructor"])
+        boost_driver = selected_team.get("boost_driver")
         actual_team_points = (
             sum(actual_scores.get(name, 0.0) for name in picked_drivers)
             + sum(actual_constructor_scores.get(name, 0.0) for name in picked_constructors)
+            + actual_scores.get(boost_driver, 0.0)
         )
         oracle_points = float(oracle_team["total_score"])
 
@@ -910,6 +912,7 @@ def run_predictive_backtest(
                 "model_cost": selected_team["total_cost"],
                 "picked_drivers": ", ".join(picked_drivers),
                 "picked_constructors": ", ".join(picked_constructors),
+                "boost_driver": boost_driver,
                 "actual_pts": round(actual_team_points, 1),
                 "oracle_pts": round(oracle_points, 1),
                 "efficiency": round(actual_team_points / oracle_points, 3) if oracle_points > 0 else 0.0,

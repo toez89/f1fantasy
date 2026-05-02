@@ -242,7 +242,11 @@ def get_boost_recommendation(opt_result: dict, score_col: str) -> dict:
     drivers = opt_result["drivers"]
     if drivers.empty or score_col not in drivers.columns:
         return {}
-    boost_row = drivers.sort_values(score_col, ascending=False).iloc[0]
+    boost_driver = opt_result.get("boost_driver")
+    if boost_driver in set(drivers["driver"]):
+        boost_row = drivers[drivers["driver"] == boost_driver].iloc[0]
+    else:
+        boost_row = drivers.sort_values(score_col, ascending=False).iloc[0]
     return {
         "driver": boost_row["driver"],
         "score": float(boost_row[score_col]),
@@ -879,7 +883,8 @@ st.caption(
 k1, k2, k3, k4, k5, k6, k7 = st.columns(7)
 k1.metric("Budget Used",  f"${opt_result['total_cost']:.1f}M",
            f"${budget_cap - opt_result['total_cost']:.1f}M remaining")
-k2.metric(primary_score_label,  f"{opt_result['base_score']:.3f}")
+k2.metric(f"Boosted {primary_score_label}",  f"{opt_result['base_score']:.3f}",
+          f"+{opt_result.get('boost_bonus', 0):.3f} boost")
 k3.metric("Drivers",      f"{len(picked_drivers)} / 5")
 k4.metric("Constructors", f"{len(picked_constructors)} / 2")
 k5.metric("Transfers", f"{opt_result['transfer_count']}",
@@ -940,8 +945,8 @@ with tab1:
         if boost_recommendation:
             st.success(
                 f"Use 2x Boost on **{boost_recommendation['driver']}** "
-                f"({boost_recommendation['team']}) — highest selected-driver "
-                f"{primary_score_label.lower()}: **{boost_recommendation['score']:.3f}**."
+                f"({boost_recommendation['team']}) — the optimizer included this free boost "
+                f"as **+{opt_result.get('boost_bonus', 0):.3f}** in the lineup score."
             )
         else:
             st.info("No 2x Boost recommendation is available for the current lineup.")

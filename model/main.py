@@ -224,6 +224,7 @@ def run_optimise(args):
         "drivers"      : list(result["drivers"]["driver"]),
         "constructors" : list(result["constructors"]["constructor"]),
         "boost_driver" : result.get("boost_driver"),
+        "boost_bonus"  : result.get("boost_bonus"),
         "total_cost"   : result["total_cost"],
         "total_score"  : result["total_score"],
     }

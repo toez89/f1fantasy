@@ -208,10 +208,12 @@ def run_backtest(
 
         picked_drivers = list(result["drivers"]["driver"])
         picked_constructors = list(result["constructors"]["constructor"])
+        boost_driver = result.get("boost_driver")
 
         actual_pts = (
             sum(actual_scores.get(d, 0) for d in picked_drivers) +
-            sum(actual_c_scores.get(c, 0) for c in picked_constructors)
+            sum(actual_c_scores.get(c, 0) for c in picked_constructors) +
+            actual_scores.get(boost_driver, 0)
         )
 
         # Theoretical best (oracle)
@@ -219,7 +221,8 @@ def run_backtest(
         all_c_scored = sorted(actual_c_scores.items(), key=lambda x: x[1], reverse=True)
         oracle_pts = (
             sum(v for _, v in all_d_scored[:5]) +
-            sum(v for _, v in all_c_scored[:2])
+            sum(v for _, v in all_c_scored[:2]) +
+            (all_d_scored[0][1] if all_d_scored else 0)
         )
 
         backtest_rows.append({
@@ -229,6 +232,7 @@ def run_backtest(
             "circuit"           : target_w["circuit"],
             "picked_drivers"    : ", ".join(picked_drivers),
             "picked_constructors": ", ".join(picked_constructors),
+            "boost_driver"      : boost_driver,
             "model_cost"        : result["total_cost"],
             "actual_pts"        : round(actual_pts, 1),
             "oracle_pts"        : round(oracle_pts, 1),
@@ -238,6 +242,7 @@ def run_backtest(
         print(f"\n  [{target_w['season']} R{target_w['round']:02d}] {target_w['race_name']}")
         print(f"    Picked: {', '.join(picked_drivers)}")
         print(f"    Constructors: {', '.join(picked_constructors)}")
+        print(f"    2x Boost: {boost_driver}")
         print(f"    Actual pts: {actual_pts:.1f}  |  Oracle: {oracle_pts:.1f}  "
               f"|  Efficiency: {actual_pts/oracle_pts:.1%}" if oracle_pts > 0 else "")
 
