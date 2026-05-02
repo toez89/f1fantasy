@@ -218,6 +218,12 @@ def _format_result(
     paid_transfers = max(0, int(transfer_count) - int(free_transfers))
     transfer_cost = float(paid_transfers * transfer_penalty)
     total_score = float(base_score - transfer_cost)
+    boost_driver = None
+    boost_score = None
+    if not d_rows.empty:
+        boost_row = d_rows.sort_values("norm_score", ascending=False).iloc[0]
+        boost_driver = boost_row["driver"]
+        boost_score = float(boost_row["norm_score"])
 
     current_d_set = set(current_d)
     current_c_set = set(current_c)
@@ -241,6 +247,8 @@ def _format_result(
         "free_transfers": int(free_transfers),
         "paid_transfers": int(paid_transfers),
         "transfer_cost": round(transfer_cost, 4),
+        "boost_driver": boost_driver,
+        "boost_score": round(boost_score, 4) if boost_score is not None else None,
         "kept_drivers": kept_drivers,
         "incoming_drivers": incoming_drivers,
         "outgoing_drivers": outgoing_drivers,
@@ -264,6 +272,11 @@ def print_team(result: dict):
     c = result["constructors"]
     for _, row in c.iterrows():
         print(f"  {row['constructor']:<26} ${row['cost_m']:.1f}M  score={row['norm_score']:.3f}")
+    if result.get("boost_driver"):
+        print(
+            f"\n  2x Boost    : {result['boost_driver']} "
+            f"(score={result['boost_score']:.3f})"
+        )
     print(f"\n  Budget used : {result['budget_used']}")
     print(f"  Total score : {result['total_score']:.4f}")
     print("=" * 62 + "\n")

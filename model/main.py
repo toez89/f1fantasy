@@ -223,6 +223,7 @@ def run_optimise(args):
     team_out = {
         "drivers"      : list(result["drivers"]["driver"]),
         "constructors" : list(result["constructors"]["constructor"]),
+        "boost_driver" : result.get("boost_driver"),
         "total_cost"   : result["total_cost"],
         "total_score"  : result["total_score"],
     }

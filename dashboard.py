@@ -238,6 +238,19 @@ def filter_defaults(default_values, options):
     return [value for value in default_values if value in option_set]
 
 
+def get_boost_recommendation(opt_result: dict, score_col: str) -> dict:
+    drivers = opt_result["drivers"]
+    if drivers.empty or score_col not in drivers.columns:
+        return {}
+    boost_row = drivers.sort_values(score_col, ascending=False).iloc[0]
+    return {
+        "driver": boost_row["driver"],
+        "score": float(boost_row[score_col]),
+        "cost_m": float(boost_row["cost_m"]),
+        "team": DRIVER_TEAM_2026.get(boost_row["driver"], "Unknown"),
+    }
+
+
 # ── page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="F1 Fantasy | Miami GP 2026",
@@ -849,6 +862,7 @@ primary_score_label = "Predicted Pts" if is_predictive else "Model Score"
 
 picked_drivers = list(opt_result["drivers"]["driver"])
 picked_constructors = list(opt_result["constructors"]["constructor"])
+boost_recommendation = get_boost_recommendation(opt_result, primary_score_col)
 
 # ── header ────────────────────────────────────────────────────────────────────
 st.title("🏎️  F1 Fantasy Model")
@@ -862,7 +876,7 @@ st.caption(
 )
 
 # ── top KPI row ───────────────────────────────────────────────────────────────
-k1, k2, k3, k4, k5, k6 = st.columns(6)
+k1, k2, k3, k4, k5, k6, k7 = st.columns(7)
 k1.metric("Budget Used",  f"${opt_result['total_cost']:.1f}M",
            f"${budget_cap - opt_result['total_cost']:.1f}M remaining")
 k2.metric(primary_score_label,  f"{opt_result['base_score']:.3f}")
@@ -872,6 +886,12 @@ k5.metric("Transfers", f"{opt_result['transfer_count']}",
           f"{opt_result['paid_transfers']} paid")
 k6.metric("After Transfer Cost", f"{opt_result['total_score']:.3f}",
           f"-{opt_result['transfer_cost']:.1f}" if opt_result["transfer_cost"] > 0 else "no penalty")
+k7.metric(
+    "2x Boost",
+    boost_recommendation.get("driver", "—"),
+    f"{boost_recommendation.get('score', 0):.3f} {primary_score_label.lower()}"
+    if boost_recommendation else "",
+)
 
 st.markdown("---")
 
@@ -916,6 +936,16 @@ with tab1:
     col_left, col_right = st.columns([1, 1])
 
     with col_left:
+        st.subheader("2x Boost Pick")
+        if boost_recommendation:
+            st.success(
+                f"Use 2x Boost on **{boost_recommendation['driver']}** "
+                f"({boost_recommendation['team']}) — highest selected-driver "
+                f"{primary_score_label.lower()}: **{boost_recommendation['score']:.3f}**."
+            )
+        else:
+            st.info("No 2x Boost recommendation is available for the current lineup.")
+
         st.subheader("Transfer Plan")
         transfer_rows = []
         for name in opt_result["incoming_drivers"]:
